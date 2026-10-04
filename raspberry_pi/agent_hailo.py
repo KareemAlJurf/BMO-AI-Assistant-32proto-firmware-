@@ -1,0 +1,2612 @@
+# =========================================================================
+#  Be More Agent (Hailo Optimized) 🤖
+#  Simplified for Pi 5 + Hailo-10H + USB Mic
+# =========================================================================
+
+import tkinter as tk
+from tkinter import ttk
+from PIL import Image, ImageTk, ImageOps, ImageDraw
+import threading
+import time
+import json
+import os
+import subprocess
+import random
+import re
+import sys
+import select
+import traceback
+import atexit
+import datetime
+import math
+from collections import deque
+import warnings
+import wave
+import struct 
+import urllib.request
+import urllib.error
+
+# Core audio dependencies
+import sounddevice as sd
+import numpy as np
+import scipy.signal 
+
+# AI Engines
+from openwakeword.model import Model
+
+# Import unified core modules
+from core.llm import Brain, extract_json_object, strip_prompt_leakage, sanitize_messages
+from core.tts import play_audio_on_hardware
+from core.stt import transcribe_audio
+from core.config import MIC_DEVICE_INDEX, MIC_SAMPLE_RATE, WAKE_WORD_MODEL, WAKE_WORD_THRESHOLD, ALSA_DEVICE, VOLUME
+
+# =========================================================================
+# 1. HARDWARE CONFIGURATION
+# =========================================================================
+
+# VISION SETTINGS
+# Set to True only if you have the rpicam-detect setup
+VISION_ENABLED = False 
+
+# =========================================================================
+# 2. GUI & STATE
+# =========================================================================
+
+class BotStates:
+    IDLE = "idle"
+    LISTENING = "listening"
+    THINKING = "thinking"
+    SPEAKING = "speaking"
+    ERROR = "error"
+    CAPTURING = "capturing"
+    WARMUP = "warmup"
+    DISPLAY_IMAGE = "display_image"
+    SCREENSAVER = "screensaver"
+    # New Expressions
+    HAPPY = "happy"
+    SAD = "sad"
+    ANGRY = "angry"
+    SURPRISED = "surprised"
+    SLEEPY = "sleepy"
+    DIZZY = "dizzy"
+    CHEEKY = "cheeky"
+    HEART = "heart"
+    STARRY_EYED = "starry_eyed"
+    CONFUSED = "confused"
+    SHHH = "shhh"
+    JAMMING = "jamming"
+    FOOTBALL = "football"
+    DETECTIVE = "detective"
+    SIR_MANO = "sir_mano"
+    LOW_BATTERY = "low_battery"
+    BEE = "bee"
+    DAYDREAM = "daydream"
+    BORED = "bored"
+    CURIOUS = "curious"
+    LADYBUG = "ladybug"
+    WORM = "worm"
+
+class BotGUI:
+
+    BG_WIDTH, BG_HEIGHT = 800, 480 
+    OVERLAY_WIDTH, OVERLAY_HEIGHT = 400, 300 
+
+    def __init__(self, master):
+        self.master = master
+        master.title("Pi Assistant")
+        master.attributes('-fullscreen', True) 
+        master.configure(cursor='none') # Hide cursor for kiosk display
+        master.bind('<Escape>', self.exit_fullscreen)
+        
+        # Events
+        self.stop_event = threading.Event()
+        self.thinking_sound_active = threading.Event()
+        self.tts_active = threading.Event()
+        self.manual_wake_event = threading.Event()
+        self.current_state = BotStates.WARMUP
+        self.last_state_change = time.time()
+        # Tracks the last real user/agent interaction.  Updated on wake fire,
+        # tap, and trigger entry — NOT on every state transition.  Watchdog
+        # uses this so a long DISPLAY_IMAGE view doesn't false-fire as "stuck".
+        self.last_user_interaction = time.time()
+        
+        # Triple-tap-to-exit: tracks timestamps of the last 3 taps
+        self._triple_tap_times = []
+
+        # Audio State
+        self.active_sounds = []
+        self._music_process = None
+        self._music_generation = 0
+        self._music_lock = threading.Lock()
+        self.current_audio_process = None
+        self.tts_queue = []
+        
+        # Concurrency & Resource Management
+        self.speak_lock = threading.Lock()
+        self.llm_lock = threading.Lock()
+        self._busy_lock = threading.Lock()  # Authoritative claim — use _try_claim_busy/_release_busy
+        self.is_busy = False  # Read-only mirror of _busy_lock state for legacy read sites
+        self._tts_aplay = None   # Shared aplay process kept alive across sentences in a turn
+        self._piper_proc = None  # Persistent Piper process for the turn
+        self._piper_reader_thread = None  # Thread piping Piper stdout → aplay stdin
+
+        # Thinking sound — single controller (no more dueling threads)
+        self.is_thinking_sound_playing = False
+        self.thinking_audio_process = None
+        self._thinking_lock = threading.Lock()
+        self._thinking_thread = None
+
+        # Per-turn LLM-action handoffs from _handle_response_chunk → main_loop
+        self.taking_photo = False
+        self.current_image_url = None
+        
+        # Memory
+        self.brain = Brain()
+        self.recent_thoughts = deque(maxlen=20)
+        
+        # Mood System
+        self.current_mood = 'neutral'
+        self.last_mood_change = 0
+        self.mood_duration = 300 # 5 minutes
+        self.mouth_open = 0 # For lip sync
+        self.eye_offset_x = 0
+        self.eye_offset_y = 0
+        self.blink_state = 0 # 0=open, 1=closed, 0.5=half
+        
+        self.expressions_map = {
+            'happy':   [BotStates.HAPPY, BotStates.HEART, BotStates.STARRY_EYED,
+                        BotStates.FOOTBALL, BotStates.CHEEKY, BotStates.JAMMING],
+            'neutral': [BotStates.IDLE, BotStates.DETECTIVE, BotStates.SIR_MANO,
+                        BotStates.BEE, BotStates.BORED, BotStates.CURIOUS,
+                        BotStates.DAYDREAM, BotStates.LADYBUG, BotStates.WORM],
+            'sad':     [BotStates.SAD, BotStates.CONFUSED, BotStates.BORED, BotStates.SHHH],
+            'sleepy':  [BotStates.SLEEPY, BotStates.DAYDREAM, BotStates.LOW_BATTERY],
+            'jamming': [BotStates.JAMMING, BotStates.HAPPY, BotStates.CHEEKY],
+        }
+        # Screensaver expression state (randomised, not time-modulo)
+        self.screensaver_expr        = BotStates.IDLE
+        self.screensaver_expr_until  = 0   # epoch when to pick next expression
+        self.screensaver_expr_dur    = 10  # seconds (refreshed randomly each pick)
+
+
+        # Init UI
+        self.background_label = tk.Label(master, bg='black')
+        self.background_label.place(x=0, y=0, width=self.BG_WIDTH, height=self.BG_HEIGHT)
+        
+        # BMO-themed captions: dark green text on translucent lime-green background
+        self.status_label = tk.Label(
+            master,
+            text="Initializing...",
+            font=('Courier New', 14, 'bold'),
+            fg='#1a5c2a',       # Dark forest green text
+            bg='#C9E4C3',       # BMO's face green
+            padx=12, pady=4,
+            relief='flat',
+            highlightthickness=0
+        )
+        self.status_label.place(relx=0.5, rely=0.92, anchor=tk.S)
+
+        self.is_muted = False
+        self.mute_label = tk.Label(
+            master,
+            text="🔇 Muted",
+            font=('Courier New', 16, 'bold'),
+            fg='#f44336',
+            bg='#C9E4C3',       # BMO's face green
+            padx=10, pady=5,
+            relief='flat',
+            highlightthickness=0
+        )
+
+        # Load persisted volume (falls back to config default)
+        try:
+            import json as _j
+            with open("settings.json") as _f:
+                self.volume = float(_j.load(_f).get("volume", VOLUME))
+        except Exception:
+            self.volume = VOLUME
+        self._volume_overlay = None
+        self._volume_hide_job = None
+
+        # Use a master click handler for hot corners and tap-to-speak
+        master.bind('<Button-1>', self.handle_click)
+        self._controller_held = set()
+        self._controller_releases = {}
+        self._controller_wake_job = None
+        master.bind('<KeyPress>', self._controller_press, add='+')
+        master.bind('<KeyRelease>', self._controller_release, add='+')
+        master.bind('<FocusOut>', self._controller_focus_out, add='+')
+
+        self.animations = {}
+        self.current_frame = 0
+        self.mouth_ema = 0.0 # Asymmetric envelope of mouth_open (fast attack, slow release)
+        self.mouth_viseme_jitter = 0 # Offset for different "phoneme" looks
+        # Viseme palette state. speaking_frame indexes the 6-shape palette
+        # produced by generate_faces.gen_speaking(): 0=closed, 1=tiny,
+        # 2=small, 3=oh, 4=wide, 5=ah. The vowel-swap timer drives 3-way
+        # alternation between OH/WIDE/AH while sustained vowel energy is
+        # detected — keeps the mouth visibly articulating instead of locking
+        # onto one open shape.
+        self.speaking_frame = 0
+        self.speaking_frame_hold_until = 0.0
+        self._vowel_swap_until = 0.0
+        # Lip-sync envelope schedule. The TTS reader thread pumps audio into
+        # aplay's 500 ms buffer as fast as it can (to stay ahead of CPU/NPU
+        # spikes), which means it races several seconds AHEAD of the audio the
+        # user actually hears. If it drove self.mouth_open directly, the mouth
+        # would finish "speaking" long before playback and then sit closed —
+        # the exact bug. Instead the reader timestamps each chunk's envelope by
+        # its playback offset here, and update_animation replays the value for
+        # the audio that's playing *right now*, keeping the mouth in sync.
+        self._lip_lock = threading.Lock()
+        self._lip_sched = []      # list of (play_offset_seconds, mouth_open)
+        self._lip_start = None    # wall-clock time the first audio chunk was queued
+        self._lip_end = None      # play_offset of the most recent chunk
+        self.load_animations()
+        self.load_sounds()
+        self.update_animation()
+
+        # Start Main Thread
+        threading.Thread(target=self.main_loop, daemon=True).start()
+
+        # Start Screensaver Audio Thread
+        self.last_screensaver_audio_time = time.time()
+        threading.Thread(target=self.screensaver_audio_loop, daemon=True).start()
+
+        # NOTE: do NOT pre-warm the VLM here. The Hailo NPU is single-device
+        # and exclusive; warming the VLM at startup grabs /dev/hailo0 before
+        # hailo-ollama can load the LLM HEF, leaving the LLM service crashing
+        # in a SEGV loop. Pay the ~3 s VLM init the first time the user asks
+        # for vision instead.
+
+    def exit_fullscreen(self, event=None):
+        # Signal all background threads to wind down before tearing the UI.
+        self.stop_event.set()
+        if self._controller_wake_job is not None:
+            self.master.after_cancel(self._controller_wake_job)
+            self._controller_wake_job = None
+        # Best-effort kill of any running audio so we don't leave aplay holding the device.
+        try:
+            self._kill_tts_pipeline()
+        except Exception:
+            pass
+        try:
+            for proc in list(self.active_sounds):
+                try: proc.terminate()
+                except Exception: pass
+        except Exception:
+            pass
+        # Flush any pending memory.json throttled writes
+        try:
+            self.brain.save_history(force=True)
+        except Exception:
+            pass
+        self.master.quit()
+
+    def set_state(self, state, msg=""):
+        if state != self.current_state:
+            self.current_state = state
+            self.current_frame = 0
+            self.last_state_change = time.time()
+            print(f"[STATE] {state.upper()}: {msg}")
+        if msg:
+            self.master.after(0, lambda: self.status_label.config(text=msg))
+
+    # ── Busy-lock helpers ────────────────────────────────────────────────────
+    def _try_claim_busy(self) -> bool:
+        """Atomic check-and-set. Returns True iff this thread now owns the busy state."""
+        if self._busy_lock.acquire(blocking=False):
+            self.is_busy = True
+            self.last_user_interaction = time.time()
+            return True
+        return False
+
+    def _release_busy(self):
+        """Release the busy lock. Safe to call from any thread; idempotent."""
+        self.is_busy = False
+        try:
+            self._busy_lock.release()
+        except RuntimeError:
+            pass  # already unlocked
+
+    def _wait_until_idle(self, states, poll_s: float = 0.5, timeout_s: float = 60.0) -> bool:
+        """Block until current_state is OUT of `states` or stop_event fires.
+        Returns True if we exited because we're no longer in those states,
+        False on shutdown / timeout.  Bounded so worker threads can't hang."""
+        end = time.time() + timeout_s
+        while self.current_state in states:
+            if self.stop_event.is_set() or time.time() >= end:
+                return False
+            time.sleep(poll_s)
+        return True
+
+    # ── Thinking-sound controller ────────────────────────────────────────────
+    def _thinking_sound_start(self):
+        """Start the thinking-sound loop. Idempotent — if a previous loop is
+        still alive, no second thread is spawned (eliminates the prior race
+        where post-STT and post-photo each spawned their own loop)."""
+        with self._thinking_lock:
+            if self.is_thinking_sound_playing:
+                return  # Already running
+            self.is_thinking_sound_playing = True
+            t = threading.Thread(target=self._thinking_sound_loop, daemon=True)
+            self._thinking_thread = t
+            t.start()
+
+    def _thinking_sound_stop(self):
+        """Signal the loop to exit; terminate the current sound process."""
+        self.is_thinking_sound_playing = False
+        proc = self.thinking_audio_process
+        self.thinking_audio_process = None
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    def _thinking_sound_loop(self):
+        try:
+            ack_proc = self.play_sound("ack_sounds")
+            if ack_proc:
+                ack_proc.wait()
+            clips_played = 0
+            while self.current_state == BotStates.THINKING and self.is_thinking_sound_playing:
+                # Leave breathing room after the acknowledgement and each clip.
+                # Long waits get quieter instead of filling every second with speech.
+                gap_total = random.uniform(3.0, 5.0) + min(clips_played * 1.5, 7.0)
+                deadline = time.monotonic() + gap_total
+                while time.monotonic() < deadline:
+                    if (self.current_state != BotStates.THINKING
+                            or not self.is_thinking_sound_playing
+                            or self.stop_event.wait(0.1)):
+                        return
+                if (self.current_state != BotStates.THINKING
+                        or not self.is_thinking_sound_playing or self.stop_event.is_set()):
+                    return
+                self.thinking_audio_process = self.play_sound("thinking_sounds")
+                if self.thinking_audio_process:
+                    self.thinking_audio_process.wait()
+                clips_played += 1
+        finally:
+            self.thinking_audio_process = None
+
+    def _controller_key(self, event):
+        # The Feather M0 / CircuitPython 5.2 descriptor supports F6-F12.
+        # Normalize these to the existing action IDs used below.
+        if event.keysym in {"F6", "F7", "F8", "F9", "F10", "F11", "F12"}:
+            return "F" + str(int(event.keysym[1:]) + 7)
+        if event.keysym in {"F13", "F14", "F15", "F16", "F17", "F18", "F19"}:
+            return event.keysym
+        # X11's default map can name these keys XF86Tools/Launch/etc.
+        # Linux evdev F13-F19 (183-189) have an X11 keycode offset of 8.
+        if self.master.tk.call("tk", "windowingsystem") == "x11":
+            if 191 <= event.keycode <= 197:
+                return "F" + str(event.keycode - 178)
+        return None
+
+    def _controller_press(self, event):
+        key = self._controller_key(event)
+        if key is None:
+            return
+        pending = self._controller_releases.pop(key, None)
+        if pending is not None:
+            self.master.after_cancel(pending)
+        if key in self._controller_held:
+            return "break"
+        self._controller_held.add(key)
+        self.last_user_interaction = time.time()
+        if key == "F13":
+            self.trigger_random_thought()
+        elif key == "F14":
+            self.mute_bmo()
+        elif key == "F15":
+            if self._controller_wake_job is not None:
+                self.master.after_cancel(self._controller_wake_job)
+                self._controller_wake_job = None
+                self.exit_fullscreen()
+            else:
+                # Wait briefly so a double press quits without starting the mic.
+                self._controller_wake_job = self.master.after(
+                    450, self._controller_listen)
+        elif key in {"F16", "F17"}:
+            delta = 0.1 if key == "F16" else -0.1
+            self.volume = max(0.0, min(1.0, round(self.volume + delta, 2)))
+            self._show_volume_overlay()
+            self._on_vol_release(None)
+        elif key == "F18":
+            self.stop_music()
+        elif key == "F19":
+            self.trigger_music()
+        return "break"
+
+    def _controller_listen(self):
+        self._controller_wake_job = None
+        if not self.stop_event.is_set() and not self.is_busy and self.current_state not in {
+            BotStates.WARMUP, BotStates.LISTENING, BotStates.THINKING,
+            BotStates.SPEAKING, BotStates.CAPTURING,
+        }:
+            self.manual_wake_event.set()
+
+    def _controller_release(self, event):
+        key = self._controller_key(event)
+        if key is None:
+            return
+        # X11 autorepeat emits release/press pairs. Wait until idle before
+        # accepting the release so holding mute cannot toggle it repeatedly.
+        def released():
+            self._controller_releases.pop(key, None)
+            self._controller_held.discard(key)
+        old = self._controller_releases.pop(key, None)
+        if old is not None:
+            self.master.after_cancel(old)
+        self._controller_releases[key] = self.master.after_idle(released)
+        return "break"
+
+    def _controller_focus_out(self, event):
+        if self._controller_wake_job is not None:
+            self.master.after_cancel(self._controller_wake_job)
+            self._controller_wake_job = None
+        for pending in self._controller_releases.values():
+            self.master.after_cancel(pending)
+        self._controller_releases.clear()
+        self._controller_held.clear()
+
+    def stop_music(self, event=None):
+        # Also cancels music queued behind its spoken introduction.
+        with self._music_lock:
+            self._music_generation += 1
+            proc = self._music_process
+            self._music_process = None
+            if proc is not None:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+        if self.current_state == BotStates.JAMMING:
+            self.set_state(BotStates.IDLE, "Music stopped")
+
+    def _play_music_generation(self, generation):
+        with self._music_lock:
+            if generation != self._music_generation or self.stop_event.is_set():
+                return None
+            return self.play_sound("music")
+
+    def handle_click(self, event):
+        """Map screen clicks to hot corners or tap-to-speak; mute is button-only."""
+        now = time.time()
+
+        # Triple-tap anywhere within 0.8 s → clean exit (useful without keyboard)
+        self._triple_tap_times.append(now)
+        self._triple_tap_times = [t for t in self._triple_tap_times if now - t <= 0.8]
+        if len(self._triple_tap_times) >= 3:
+            print("[TRIPLE-TAP] Exiting BMO...")
+            self.exit_fullscreen()
+            return
+
+        # Any click counts as a user interaction — keeps the watchdog honest
+        # regardless of which branch handles the tap.
+        self.last_user_interaction = now
+
+        if self.current_state == BotStates.DISPLAY_IMAGE:
+            self.set_state(BotStates.IDLE, "Tap to speak")
+            return
+
+        x, y = event.x, event.y
+        win_w = self.master.winfo_width()
+        win_h = self.master.winfo_height()
+        corner_w = win_w // 4
+        corner_h = win_h // 4
+
+        # Mouth zone: centre-lower portion of the face (where BMO's mouth lives)
+        mouth_x0 = int(win_w * 0.27)
+        mouth_x1 = int(win_w * 0.73)
+        mouth_y0 = int(win_h * 0.55)
+        mouth_y1 = int(win_h * 0.80)
+        in_mouth = mouth_x0 <= x <= mouth_x1 and mouth_y0 <= y <= mouth_y1
+
+        # Top-centre volume zone: middle 40% of width, top 15% of height
+        vol_x0 = int(win_w * 0.30)
+        vol_x1 = int(win_w * 0.70)
+        in_vol = vol_x0 <= x <= vol_x1 and y < int(win_h * 0.15)
+
+        if in_vol:
+            print(f"[CLICK] Top-Centre: Volume overlay ({x},{y})")
+            self.master.after(0, self._show_volume_overlay)
+        elif x < corner_w and y < corner_h:
+            print(f"[CLICK] Top-Left: Generate Image ({x},{y})")
+            self.trigger_generate_image()
+        elif x > win_w - corner_w and y < corner_h:
+            print(f"[CLICK] Top-Right: Random Pondering ({x},{y})")
+            self.trigger_random_thought()
+        elif x > win_w - corner_w and y > win_h - corner_h:
+            print(f"[CLICK] Bottom-Right: Play Music ({x},{y})")
+            self.trigger_music()
+        elif (x < corner_w and y > win_h - corner_h) or in_mouth:
+            # These former mute zones can receive unwanted touch clicks.
+            # Reserve mute for the physical small circle; do not turn these
+            # clicks into a wake request either.
+            print(f"[CLICK] Former mute zone ignored ({x},{y})")
+            return
+        elif self.current_state in [BotStates.IDLE, BotStates.SCREENSAVER]:
+            print(f"[CLICK] Body: Manual Wake ({x},{y})")
+            self.manual_wake_event.set()
+        else:
+            print(f"[CLICK] Ignored in state {self.current_state} ({x},{y})")
+
+    # ── Volume overlay ────────────────────────────────────────────────────────
+    # Custom Canvas-based slider. tk.Scale's default thumb is ~15 px wide,
+    # which is fiddly to grab on a finger-driven 800×480 panel; this draws
+    # a chunky rounded track + 60 px knob + big readout in BMO's mouth
+    # palette. Tap anywhere on the track to jump; drag the knob (or
+    # anywhere on the track) to fine-tune.
+
+    # BMO palette (matches the new viseme assets)
+    _VOL_BG       = '#C9E4C3'   # body green
+    _VOL_FILL     = '#396337'   # mouth dark green
+    _VOL_TROUGH   = '#A2B36A'   # tongue light green
+    _VOL_OUTLINE  = 'black'
+    _VOL_TEXT     = '#1a3d18'   # nearly-black for readout
+    _VOL_MUTE_FG  = '#8a1a1a'   # muted-red for the muted-state cues
+
+    def _create_volume_overlay(self):
+        win_w = self.master.winfo_width() or self.BG_WIDTH
+
+        OW = min(720, int(win_w * 0.92))
+        OH = 120
+        PAD = 14
+        ICON_W = 64
+        PCT_W = 90
+        TRACK_X0 = PAD + ICON_W
+        TRACK_X1 = OW - PAD - PCT_W
+        TRACK_H  = 32
+        TRACK_Y  = (OH - TRACK_H) // 2
+        KNOB_R   = 30
+
+        cv = tk.Canvas(self.master, width=OW, height=OH,
+                       bg=self._VOL_BG, highlightthickness=0, bd=0)
+
+        # Outer pill: BMO body green with a thick dark-green outline so the
+        # overlay reads as a unified card sitting on top of BMO's face.
+        self._draw_rounded_rect(cv, 3, 3, OW-3, OH-3, r=22,
+                                fill=self._VOL_BG, outline=self._VOL_FILL,
+                                width=4)
+
+        # Speaker glyph (left) — switches to 🔇 when muted (volume == 0).
+        icon_id = cv.create_text(PAD + ICON_W//2, OH//2, text='🔊',
+                                 font=('DejaVu Sans', 30),
+                                 fill=self._VOL_TEXT, anchor='center')
+
+        # Track background (the unfilled portion shows through this)
+        self._draw_rounded_rect(cv, TRACK_X0, TRACK_Y,
+                                TRACK_X1, TRACK_Y + TRACK_H, r=TRACK_H//2,
+                                fill=self._VOL_TROUGH,
+                                outline=self._VOL_OUTLINE, width=3)
+
+        # Track fill — placeholder, redrawn on every level change
+        fill_id = self._draw_rounded_rect(
+            cv, TRACK_X0, TRACK_Y, TRACK_X0 + 1, TRACK_Y + TRACK_H,
+            r=TRACK_H//2, fill=self._VOL_FILL, outline='',
+        )
+
+        # Knob — a fat circle with a black outline, like BMO's eyes
+        cy = TRACK_Y + TRACK_H // 2
+        knob_id = cv.create_oval(
+            TRACK_X0 - KNOB_R, cy - KNOB_R,
+            TRACK_X0 + KNOB_R, cy + KNOB_R,
+            fill=self._VOL_FILL, outline=self._VOL_OUTLINE, width=4,
+        )
+
+        # Percentage readout (right)
+        pct_id = cv.create_text(
+            OW - PAD - PCT_W//2, OH//2, text='100%',
+            font=('Courier New', 24, 'bold'),
+            fill=self._VOL_TEXT, anchor='center',
+        )
+
+        cv.place(relx=0.5, rely=0.02, anchor=tk.N)
+
+        # Stash geometry/IDs for the live update path
+        self._vol_canvas    = cv
+        self._vol_track_x0  = TRACK_X0
+        self._vol_track_x1  = TRACK_X1
+        self._vol_track_y   = TRACK_Y
+        self._vol_track_h   = TRACK_H
+        self._vol_knob_r    = KNOB_R
+        self._vol_knob_id   = knob_id
+        self._vol_fill_id   = fill_id
+        self._vol_pct_id    = pct_id
+        self._vol_icon_id   = icon_id
+
+        # Tap = jump; drag = follow finger; release = persist to disk.
+        cv.bind('<ButtonPress-1>',   self._on_vol_press)
+        cv.bind('<B1-Motion>',       self._on_vol_drag)
+        cv.bind('<ButtonRelease-1>', self._on_vol_release)
+
+        self._volume_overlay = cv
+        self._update_volume_visual()
+
+    def _draw_rounded_rect(self, cv, x1, y1, x2, y2, r=10, **kwargs):
+        """Draw an approximated rounded rectangle on cv. Returns the polygon
+        id so callers can delete/re-create on update. Uses smooth=True on a
+        12-point polygon, which is good enough at the chunky sizes we use
+        and avoids juggling 6 canvas items per shape."""
+        pts = [
+            x1+r, y1,   x2-r, y1,   x2, y1,
+            x2,   y1+r, x2,   y2-r, x2, y2,
+            x2-r, y2,   x1+r, y2,   x1, y2,
+            x1,   y2-r, x1,   y1+r, x1, y1,
+        ]
+        return cv.create_polygon(pts, smooth=True, **kwargs)
+
+    def _show_volume_overlay(self):
+        if self._volume_overlay is None:
+            self._create_volume_overlay()
+        else:
+            self._update_volume_visual()
+            self._volume_overlay.place(relx=0.5, rely=0.02, anchor=tk.N)
+            # Canvas.tkraise raises canvas items and needs a tag. Raise the
+            # widget itself; otherwise TclError prevents the hide timer reset.
+            tk.Misc.tkraise(self._volume_overlay)
+        self._reset_volume_hide()
+
+    def _hide_volume_overlay(self):
+        if self._volume_overlay:
+            self._volume_overlay.place_forget()
+        self._volume_hide_job = None
+
+    def _on_vol_press(self, event):
+        self._set_volume_from_x(event.x)
+        self._reset_volume_hide()
+
+    def _on_vol_drag(self, event):
+        self._set_volume_from_x(event.x)
+        self._reset_volume_hide()
+
+    def _on_vol_release(self, event):
+        self._reset_volume_hide()
+        # Debounce disk writes — drags fire many press/drag events but only
+        # a single release. Schedule the write a beat later so a quick
+        # repeat tap doesn't write twice.
+        if getattr(self, '_volume_save_job', None):
+            self.master.after_cancel(self._volume_save_job)
+        self._volume_save_job = self.master.after(400, self._persist_volume)
+
+    def _set_volume_from_x(self, x):
+        x0, x1 = self._vol_track_x0, self._vol_track_x1
+        x = max(x0, min(x1, x))
+        self.volume = (x - x0) / (x1 - x0)
+        self._update_volume_visual()
+
+    def _update_volume_visual(self):
+        cv = self._vol_canvas
+        x0, x1 = self._vol_track_x0, self._vol_track_x1
+        ty, th = self._vol_track_y, self._vol_track_h
+        r  = self._vol_knob_r
+        cy = ty + th // 2
+        x  = x0 + self.volume * (x1 - x0)
+
+        # When the slider sits at 0 every audio path multiplies PCM by 0
+        # → silent output. That's a hard mute, so make it visually
+        # unmistakable: 🔇 icon, red knob, "MUTED" readout. Otherwise an
+        # accidental drag-to-zero looks identical to a stuck app.
+        muted = self.volume <= 0.001
+        knob_fill = self._VOL_MUTE_FG if muted else self._VOL_FILL
+        text_fg   = self._VOL_MUTE_FG if muted else self._VOL_TEXT
+
+        # Knob — recolour as well as reposition
+        cv.coords(self._vol_knob_id, x - r, cy - r, x + r, cy + r)
+        cv.itemconfig(self._vol_knob_id, fill=knob_fill)
+
+        # Fill — easier to recreate than to mutate a smoothed polygon
+        cv.delete(self._vol_fill_id)
+        # Draw at least a rounded "cap" so the fill never becomes a sliver
+        # that looks broken at the very-low end.
+        x_end = max(x, x0 + th // 2)
+        self._vol_fill_id = self._draw_rounded_rect(
+            cv, x0, ty, x_end, ty + th, r=th // 2,
+            fill=knob_fill, outline='',
+        )
+        cv.tag_raise(self._vol_knob_id)
+
+        cv.itemconfig(self._vol_icon_id,
+                      text='🔇' if muted else '🔊',
+                      fill=text_fg)
+        cv.itemconfig(self._vol_pct_id,
+                      text='MUTED' if muted else f"{int(round(self.volume * 100))}%",
+                      fill=text_fg,
+                      font=('Courier New', 18, 'bold') if muted
+                           else ('Courier New', 24, 'bold'))
+
+    def _reset_volume_hide(self):
+        if self._volume_hide_job:
+            self.master.after_cancel(self._volume_hide_job)
+        self._volume_hide_job = self.master.after(3000, self._hide_volume_overlay)
+
+    def _persist_volume(self):
+        self._volume_save_job = None
+        try:
+            import json as _j
+            with open("settings.json", "w") as _f:
+                _j.dump({"volume": self.volume}, _f)
+        except Exception:
+            pass
+
+    def mute_bmo(self, event=None):
+        """Toggle audio mute. Heavy cleanup is dispatched to a worker so the
+        Tk thread (and the rest of the UI) never blocks on proc.wait/join."""
+        self.is_muted = not self.is_muted
+        print(f"[MUTE] Small-circle button: {'muted' if self.is_muted else 'unmuted'}", flush=True)
+        if self.is_muted:
+            self.stop_music()
+            self.mute_label.place(relx=0.95, rely=0.05, anchor=tk.NE)
+
+            old_state = self.current_state
+            self.set_state(BotStates.SHHH, "Muted")
+
+            # Snapshot processes to terminate, then clear lists immediately so
+            # the worker can do its slow work without further race exposure.
+            sounds_to_kill = self.active_sounds[:]
+            self.active_sounds = []
+            self.is_thinking_sound_playing = False
+            thinking_proc = self.thinking_audio_process
+            self.thinking_audio_process = None
+
+            def _mute_cleanup_worker():
+                for proc in sounds_to_kill:
+                    try:
+                        proc.terminate()
+                        print(f"[MUTE] Terminated active sound process: {proc.pid}")
+                    except Exception:
+                        pass
+                if thinking_proc is not None:
+                    try:
+                        thinking_proc.terminate()
+                    except Exception:
+                        pass
+                self._kill_tts_pipeline()
+            threading.Thread(target=_mute_cleanup_worker, daemon=True).start()
+
+            # After 3 seconds, resume natural state
+            def revert_state():
+                if self.current_state == BotStates.SHHH:
+                    self.set_state(old_state if old_state != BotStates.SHHH else BotStates.IDLE, "Muted")
+            self.master.after(3000, revert_state)
+        else:
+            self.mute_label.place_forget()
+            self.set_state(BotStates.HAPPY, "Unmuted!")
+            def revert_state():
+                if self.current_state == BotStates.HAPPY:
+                    self.set_state(BotStates.IDLE, "Tap to speak")
+            self.master.after(2000, revert_state)
+
+    # --- ANIMATION & SOUND ENGINE ---
+    def load_sounds(self):
+        self._thinking_sound_bag = []
+        self._last_thinking_sound = None
+        self.sounds = {
+            "greeting_sounds": [],
+            "ack_sounds": [],
+            "thinking_sounds": [],
+            "music": []
+        }
+        base = "sounds"
+        for category in self.sounds.keys():
+            path = os.path.join(base, category)
+            if os.path.exists(path):
+                self.sounds[category] = [os.path.join(path, f) for f in os.listdir(path) if f.lower().endswith('.wav')]
+
+    def _start_sound_playback(self, sound_file):
+        """Stream WAV samples so the volume controls also affect music/clips."""
+        source = wave.open(sound_file, "rb")
+        try:
+            if source.getsampwidth() != 2 or source.getcomptype() != "NONE":
+                raise ValueError("BMO sound clips must use uncompressed 16-bit PCM")
+            proc = subprocess.Popen(
+                ['aplay', '-D', ALSA_DEVICE, '-q', '-t', 'raw', '-f', 'S16_LE',
+                 '-r', str(source.getframerate()), '-c', str(source.getnchannels()),
+                 '--buffer-time=500000'], stdin=subprocess.PIPE)
+        except Exception:
+            source.close()
+            raise
+
+        def feed_audio():
+            try:
+                with source:
+                    while not self.stop_event.is_set() and not self.is_muted:
+                        data = source.readframes(2048)
+                        if not data:
+                            break
+                        samples = np.frombuffer(data, dtype='<i2')
+                        data = (samples.astype(np.float32) * self.volume).clip(
+                            -32768, 32767).astype('<i2').tobytes()
+                        proc.stdin.write(data)
+            except (BrokenPipeError, OSError):
+                pass  # Stop/mute terminates aplay while this worker is feeding it.
+            finally:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+        threading.Thread(target=feed_audio, daemon=True).start()
+        return proc
+
+    def play_sound(self, category):
+        if self.is_muted:
+            return None
+        sounds = self.sounds.get(category, [])
+        if not sounds:
+            return None
+        if category == "thinking_sounds":
+            # Keep the bag across turns: hear every clip before repeating one.
+            if not self._thinking_sound_bag:
+                self._thinking_sound_bag = list(sounds)
+                random.shuffle(self._thinking_sound_bag)
+                if (len(self._thinking_sound_bag) > 1
+                        and self._thinking_sound_bag[-1] == self._last_thinking_sound):
+                    self._thinking_sound_bag[0], self._thinking_sound_bag[-1] = (
+                        self._thinking_sound_bag[-1], self._thinking_sound_bag[0])
+            sound_file = self._thinking_sound_bag.pop()
+            self._last_thinking_sound = sound_file
+        else:
+            sound_file = random.choice(sounds)
+        try:
+            # For pre-recorded sounds, we'll manually set mouth_open to animate
+            # while the sound plays, since aplay doesn't give us volume data.
+            def animate_mouth_simple(proc):
+                while proc.poll() is None:
+                    # Randomly fluctuate mouth between 15 and 45 for pre-recorded speech
+                    self.mouth_open = random.randint(15, 45)
+                    time.sleep(0.08)
+                self.mouth_open = 0
+
+            proc = self._start_sound_playback(sound_file)
+            self.active_sounds.append(proc)
+            if category == "music":
+                self._music_process = proc
+            
+            # Start mouth animation thread for this sound
+            if category in ["greeting_sounds", "thinking_sounds"]:
+                threading.Thread(target=animate_mouth_simple, args=(proc,), daemon=True).start()
+            elif category == "music":
+                self.set_state(BotStates.JAMMING, "Jamming!")
+
+            # Cleanup thread to remove finished processes (guard against zombies)
+            def cleanup():
+                try:
+                    proc.wait(timeout=600)  # Music can be long; cap at 10 min
+                except subprocess.TimeoutExpired:
+                    print(f"[SOUND] Cleanup timeout — terminating stuck proc {proc.pid}")
+                    try: proc.terminate()
+                    except Exception: pass
+                if proc in self.active_sounds:
+                    self.active_sounds.remove(proc)
+                if category == "music":
+                    with self._music_lock:
+                        if self._music_process is proc:
+                            self._music_process = None
+                            if self.current_state == BotStates.JAMMING:
+                                self.set_state(BotStates.IDLE, "Tap to speak")
+            threading.Thread(target=cleanup, daemon=True).start()
+            return proc
+        except Exception as e:
+            print(f"Error playing sound {sound_file}: {e}")
+            return None
+
+    # States needed before the GUI can be useful — loaded synchronously.
+    CORE_ANIMATION_STATES = (
+        BotStates.IDLE, BotStates.LISTENING, BotStates.SPEAKING,
+        BotStates.THINKING, BotStates.WARMUP, BotStates.ERROR,
+        BotStates.CAPTURING,
+    )
+
+    def _load_state_frames(self, state):
+        path = os.path.join("faces", state)
+        if not os.path.isdir(path):
+            return []
+        files = sorted(f for f in os.listdir(path) if f.lower().endswith('.png'))
+        frames = []
+        for f in files:
+            try:
+                img = Image.open(os.path.join(path, f))
+                if img.size != (self.BG_WIDTH, self.BG_HEIGHT):
+                    img = img.resize((self.BG_WIDTH, self.BG_HEIGHT), Image.Resampling.LANCZOS)
+                frames.append(ImageTk.PhotoImage(img))
+            except Exception as e:
+                print(f"Error loading frame {f}: {e}")
+        return frames
+
+    def load_animations(self):
+        """Load core PNG frames synchronously; defer expressions to background."""
+        self.animations = {}
+        for state in self.CORE_ANIMATION_STATES:
+            frames = self._load_state_frames(state)
+            if frames:
+                self.animations[state] = frames
+
+        all_states = [d for d in os.listdir("faces") if os.path.isdir(os.path.join("faces", d))]
+        self._pending_states = [s for s in all_states if s not in self.animations]
+        print(f"Loaded core animations: {list(self.animations.keys())}; "
+              f"deferring {len(self._pending_states)} expression states")
+        self.tk_img = None
+        # Kick off lazy load on the Tk event loop after first render.
+        self.master.after(150, self._load_next_pending_state)
+
+    def _load_next_pending_state(self):
+        """Load one deferred animation per Tk tick to keep UI responsive."""
+        if not getattr(self, '_pending_states', None):
+            return
+        state = self._pending_states.pop(0)
+        frames = self._load_state_frames(state)
+        if frames:
+            self.animations[state] = frames
+        # Yield to the event loop between dirs so the UI stays smooth.
+        self.master.after(20, self._load_next_pending_state)
+
+    def update_animation(self):
+        if self.current_state == BotStates.DISPLAY_IMAGE:
+            self.master.after(500, self.update_animation)
+            return
+
+        now = time.time()
+        # Mood Logic
+        if now - self.last_mood_change > self.mood_duration:
+            self.current_mood = random.choice(list(self.expressions_map.keys()))
+            self.last_mood_change = now
+            print(f"[MOOD] BMO is now feeling: {self.current_mood}")
+
+        # Screensaver Auto-Trigger
+        if self.current_state == BotStates.IDLE and (now - self.last_state_change) > 60:
+            self.set_state(BotStates.SCREENSAVER, "Screensaver...")
+
+        # If in screensaver, pick expression randomly; change every 8-18 s
+        display_state = self.current_state
+        if self.current_state == BotStates.SCREENSAVER:
+            if now >= self.screensaver_expr_until:
+                mood_pool = self.expressions_map[self.current_mood]
+                # 30 % chance to pull one extra from a random other mood for variety
+                if random.random() < 0.30:
+                    other = random.choice([m for m in self.expressions_map
+                                           if m != self.current_mood])
+                    candidates = mood_pool + self.expressions_map[other]
+                else:
+                    candidates = mood_pool
+                self.screensaver_expr       = random.choice(candidates)
+                self.screensaver_expr_dur   = random.uniform(8, 18)
+                self.screensaver_expr_until = now + self.screensaver_expr_dur
+            display_state = self.screensaver_expr
+
+        # Hide text status label during screensaver
+        if self.current_state == BotStates.SCREENSAVER:
+            if self.status_label.winfo_ismapped(): self.status_label.place_forget()
+        else:
+            if not self.status_label.winfo_ismapped():
+                self.status_label.place(relx=0.5, rely=0.92, anchor=tk.S)
+
+        # Animation Loop
+        frames = self.animations.get(display_state, self.animations.get(BotStates.IDLE, []))
+        if frames:
+            if display_state == BotStates.SPEAKING:
+                # Drive a 6-shape viseme palette from the audio envelope.
+                # Shapes come from Rhubarb-animated frames (24 fps, artist-drawn):
+                # 0=CLOSED (flat line, B/P/M), 1=TINY (small curve, rest/H),
+                # 2=SMALL (slightly open, medium vowels),
+                # 3=OH (wide teeth smile, EE/open vowel),
+                # 4=WIDE (round oval, OOH/W),
+                # 5=AH (very wide open, emphatic vowels).
+                # OH/WIDE/AH rotate on a timer so sustained vowels get visual
+                # variety instead of locking onto one shape.
+
+                # Pull the loudness of the audio that's playing RIGHT NOW from
+                # the schedule the reader thread filled. `elapsed` is how long
+                # since the first chunk was queued (~playback start); we advance
+                # to the latest chunk whose playback offset has arrived and drop
+                # what's already played. Past the final chunk, close the mouth.
+                if self._lip_start is not None:
+                    elapsed = now - self._lip_start
+                    with self._lip_lock:
+                        sched = self._lip_sched
+                        val = None
+                        consumed = 0
+                        while consumed < len(sched) and sched[consumed][0] <= elapsed:
+                            val = sched[consumed][1]
+                            consumed += 1
+                        if consumed:
+                            del sched[:consumed]
+                        lip_end = self._lip_end
+                    if val is not None:
+                        self.mouth_open = val
+                    elif lip_end is not None and elapsed > lip_end + 0.15:
+                        self.mouth_open = 0
+
+                # Asymmetric envelope: vowel onsets pop the mouth open in one
+                # tick (fast attack), then it relaxes over ~150 ms (slow
+                # release). A symmetric EMA smooths attacks too much and
+                # makes the mouth feel laggy.
+                if self.mouth_open > self.mouth_ema:
+                    self.mouth_ema = self.mouth_ema * 0.30 + self.mouth_open * 0.70
+                else:
+                    self.mouth_ema = self.mouth_ema * 0.85 + self.mouth_open * 0.15
+
+                cur = self.speaking_frame
+                lvl = self.mouth_ema
+
+                if cur >= 3:
+                    # In the open-vowel zone. Either drop out (energy fell)
+                    # or rotate to a different open shape on the swap timer.
+                    if lvl < 22:
+                        target = 2
+                    elif now >= self._vowel_swap_until:
+                        # 3-way rotation among OH(3) / WIDE(4) / AH(5).
+                        # random.choice keeps the variety unpredictable so
+                        # sustained vowels never settle into a 2-step pattern.
+                        choices = [i for i in (3, 4, 5) if i != cur]
+                        target = random.choice(choices)
+                        self._vowel_swap_until = now + random.uniform(0.12, 0.22)
+                    else:
+                        target = cur
+                else:
+                    # Closed/tiny/small zone — pick by energy with hysteresis.
+                    if   lvl < 4:   target = 0
+                    elif lvl < 13:  target = 1
+                    elif lvl < 26:  target = 2
+                    else:
+                        target = 3   # enter vowel zone via OH
+                        # Hold OH briefly on entry so the rotation above
+                        # doesn't immediately swap on the next tick.
+                        self._vowel_swap_until = now + random.uniform(0.12, 0.22)
+
+                # Coarticulation gate: when CLOSING, step through intermediate
+                # shapes one at a time so the mouth visibly relaxes instead of
+                # popping shut. Opens can still jump freely so vowel onsets
+                # feel snappy. The OH↔WIDE swap is treated as same-zone.
+                if target < cur - 1 and not (cur >= 3 and target >= 3):
+                    target = cur - 1
+
+                # Min hold so a single audio blip doesn't change the shape
+                # every 40 ms tick. Faster on opens, slower on closes — the
+                # mouth should look like it's doing something deliberate.
+                if target != cur and now >= self.speaking_frame_hold_until:
+                    self.speaking_frame = target
+                    self.speaking_frame_hold_until = now + (
+                        0.06 if target > cur else 0.10
+                    )
+                self.current_frame = self.speaking_frame
+            else:
+                self.current_frame = (self.current_frame + 1) % len(frames)
+
+            # Skip the Tk reconfigure when nothing actually changed — avoids
+            # syscalls when the speaking EMA holds the same frame for a while.
+            new_key = (display_state, self.current_frame)
+            if getattr(self, '_last_render_key', None) != new_key:
+                self.tk_img = frames[self.current_frame]
+                self.background_label.config(image=self.tk_img)
+                self._last_render_key = new_key
+
+        # Dynamic frame rate: 40ms (25fps) for speaking lip-sync, 120ms for everything else
+        interval = 40 if display_state == BotStates.SPEAKING else 120
+        self.master.after(interval, self.update_animation)
+
+    # --- AUDIO INPUT ---
+    def wait_for_wakeword(self, oww):
+        """Block until wake word is heard with retry logic for mic errors."""
+        CHUNK = 1280
+        capture_rate = MIC_SAMPLE_RATE # 48000
+        target_rate = 16000
+        downsample_factor = capture_rate // target_rate
+        
+        print(f"[EARS] Waiting for wake word... (Index: {MIC_DEVICE_INDEX}, Rate: {capture_rate})")
+        
+        retry_count = 0
+        while not self.stop_event.is_set():
+            try:
+                # Use a smaller blocksize to reduce latency
+                with sd.InputStream(samplerate=capture_rate, device=MIC_DEVICE_INDEX, channels=1, dtype='int16', blocksize=CHUNK * downsample_factor) as stream:
+                    retry_count = 0 # Reset on success
+                    last_data_time = time.time()
+                    while not self.stop_event.is_set():
+                        if self.manual_wake_event.is_set():
+                            self.manual_wake_event.clear()
+                            print("[EARS] Wake triggered via tap.")
+                            return True
+
+                        if self.is_busy:
+                            time.sleep(0.5)
+                            last_data_time = time.time() # Reset watchdog
+                            continue
+                            
+                        data, overflowed = stream.read(CHUNK * downsample_factor)
+                        
+                        # Real failure modes: None / wrong-shape data
+                        if data is None or data.size == 0:
+                            if time.time() - last_data_time > 10.0:
+                                print("[EARS] Watchdog: Mic stream returned None/empty. Restarting...")
+                                break
+                            time.sleep(0.01)
+                            continue
+
+                        last_data_time = time.time()  # Pet the watchdog (we got real data)
+
+                        # 1. Quick Volume Check (Skip OWW if it's too quiet)
+                        # All-zero arrays are valid (quiet room) — don't treat as a mic failure.
+                        current_max = np.max(np.abs(data))
+                        if current_max < 250: # Adjust threshold as needed
+                            continue
+
+                        # 2. Down-sample 48 kHz → 16 kHz with an IIR low-pass
+                        # before decimating.  Nearest-neighbor slicing aliases
+                        # high-frequency speech content into the OWW band and
+                        # hurts wake-word reliability in noisy rooms.
+                        flat = data.flatten()
+                        if downsample_factor >= 2:
+                            audio_16k = scipy.signal.decimate(
+                                flat, downsample_factor, ftype='iir', zero_phase=False,
+                            ).astype(np.int16)
+                        else:
+                            audio_16k = flat
+
+                        # 3. Predict
+                        oww.predict(audio_16k)
+                        
+                        for key in oww.prediction_buffer.keys():
+                            score = oww.prediction_buffer[key][-1]
+                            if score > WAKE_WORD_THRESHOLD:
+                                print(f"[EARS] Wake Word Detected: {key} (Score: {score:.2f})")
+                                oww.reset()
+                                return True
+            except Exception as e:
+                retry_count += 1
+                print(f"[EARS] Audio Input Error (Attempt {retry_count}): {e}")
+                self.set_state(BotStates.ERROR, "Mic Error")
+                if retry_count > 5:
+                    print("[EARS] Too many mic errors, restarting audio system...")
+                    if self.stop_event.wait(timeout=5):
+                        return False
+                    retry_count = 0
+                if self.stop_event.wait(timeout=2):
+                    return False
+                # Try to go back to IDLE if we were in ERROR
+                if self.current_state == BotStates.ERROR:
+                    self.set_state(BotStates.IDLE, "Retrying mic...")
+        return False
+
+    def record_audio(self):
+        """Record until silence with volume-driven lip sync, with retry logic for mic errors."""
+        print("Recording...")
+        filename = "input.wav"
+        frames = []
+        from core.recording import SilenceDetector
+        detector = SilenceDetector(
+            MIC_SAMPLE_RATE,
+            threshold=float(os.environ.get("BMO_SPEECH_THRESHOLD", "300")),
+            silence_seconds=float(os.environ.get("BMO_SILENCE_SECONDS", "0.8")),
+        )
+        recording_done = threading.Event()
+        total_samples = 0
+        MAX_SAMPLES = MIC_SAMPLE_RATE * 15  # 15-second hard cap
+
+        def callback(indata, frames_count, time, status):
+            nonlocal total_samples
+            if recording_done.is_set():
+                return
+            vol = np.linalg.norm(indata)
+            # Update mouth_open for real-time lip sync during recording (listening mode)
+            if self.current_state == BotStates.LISTENING:
+                self.mouth_open = min(60, vol / 500)
+
+            frames.append(indata.copy())
+            total_samples += indata.shape[0]
+            if detector.update(indata):
+                recording_done.set()
+
+        retry_count = 0
+        while retry_count < 3:
+            try:
+                with sd.InputStream(samplerate=MIC_SAMPLE_RATE, device=MIC_DEVICE_INDEX, channels=1, dtype='int16', callback=callback):
+                    last_callback_samples = 0
+                    last_callback_at = time.time()
+                    while not self.stop_event.is_set():
+                        sd.sleep(50)
+                        if recording_done.is_set():
+                            print(f"[REC] Stopped after quiet at {total_samples / MIC_SAMPLE_RATE:.2f}s")
+                            break
+                        if total_samples >= MAX_SAMPLES: break  # 15-second hard cap (sample-accurate)
+                        # Watchdog: if the callback stops firing mid-recording
+                        # (USB unplug, driver crash) the polling loop would hang.
+                        if total_samples > last_callback_samples:
+                            last_callback_samples = total_samples
+                            last_callback_at = time.time()
+                        elif time.time() - last_callback_at > 3.0:
+                            print("[REC] Watchdog: callback stopped firing — aborting record.")
+                            break
+                    break # Success!
+            except Exception as e:
+                retry_count += 1
+                print(f"Recording Error (Attempt {retry_count}): {e}")
+                time.sleep(1)
+                if retry_count >= 3:
+                    self.set_state(BotStates.ERROR, "Mic Error")
+                    return None
+
+        self.mouth_open = 0 # Reset
+        if not frames: return None
+        data = np.concatenate(frames, axis=0)
+
+        # Down-sample 48 kHz → 16 kHz with a polyphase filter (better than the
+        # old ffmpeg subprocess + extra disk write). 48000 / 3 = 16000 exactly.
+        import scipy.io.wavfile
+        ratio = MIC_SAMPLE_RATE // 16000
+        if MIC_SAMPLE_RATE == 16000 or ratio < 2:
+            data_16k = data.flatten()
+        else:
+            data_16k = scipy.signal.resample_poly(data.flatten().astype(np.float32), 1, ratio)
+            data_16k = np.clip(data_16k, -32768, 32767).astype(np.int16)
+        scipy.io.wavfile.write(filename, 16000, data_16k)
+        return filename
+    # --- TIMERS & REMINDERS ---
+    def start_timer_thread(self, minutes, message):
+        def timer_worker():
+            print(f"[TIMER SET] for {minutes} minutes. Message: {message}")
+            # Wait on stop_event so app shutdown drains the timer immediately.
+            if self.stop_event.wait(timeout=minutes * 60):
+                print(f"[TIMER CANCELLED] (app shutting down): {message}")
+                return
+            print(f"[TIMER DONE] {message}")
+            
+            # Wait for BMO to finish speaking/listening to avoid ALSA conflicts
+            self._wait_until_idle({BotStates.SPEAKING, BotStates.LISTENING}, poll_s=1.0, timeout_s=120)
+                
+            # Interject the alarm
+            old_state = self.current_state
+            self.set_state(BotStates.HAPPY, "Reminder!")
+            # Play an alert noise if we have one
+            alert_proc = self.play_sound("ack_sounds")
+            if alert_proc:
+                alert_proc.wait()
+                
+            self.speak(message, msg="Reminder!")
+            
+            # Return BMO to whatever they were doing (e.g. IDLE or SCREENSAVER)
+            time.sleep(1)
+            if self.current_state == BotStates.IDLE:
+                self.set_state(old_state if old_state != BotStates.HAPPY else BotStates.IDLE, "Ready")
+                
+        threading.Thread(target=timer_worker, daemon=True).start()
+
+    # --- STT & TTS ---
+    def transcribe(self, filename):
+        print("Transcribing...")
+        return transcribe_audio(filename)
+
+    def play_audio_with_sync(self, audio_data_input):
+        """Play PCM audio and update mouth_open in real-time for sync. 
+        Supports both bytes and file-like streams."""
+        from core.config import ALSA_DEVICE
+        import io
+
+        # 22050 Hz, 16-bit, Mono (Piper default)
+        sample_rate = 22050
+        # Reduced chunk size for more reactive lip-sync updates (roughly every 23ms)
+        chunk_size = 512 # samples 
+
+        if isinstance(audio_data_input, bytes):
+            stream = io.BytesIO(audio_data_input)
+        else:
+            stream = audio_data_input
+
+        # Start aplay with a much larger buffer to prevent stuttering during CPU/NPU spikes.
+        # --buffer-time=500000 is 500ms, which provides a very stable buffer for the Pi 5.
+        aplay_cmd = ["aplay", "-D", ALSA_DEVICE, "-r", str(sample_rate), "-f", "S16_LE", "-t", "raw", "-q", "--buffer-time=500000"]
+        
+        # Stop the thinking sound ONCE before retrying — not on every attempt.
+        self.is_thinking_sound_playing = False
+        if self.thinking_audio_process is not None:
+            try:
+                self.thinking_audio_process.terminate()
+                self.thinking_audio_process.wait(timeout=0.5)
+            except Exception:
+                pass
+            self.thinking_audio_process = None
+
+        # Hardware Retry Loop: If the thinking sound hasn't fully released the
+        # hardware yet, we retry a few times before giving up.
+        proc = None
+        for attempt in range(10):
+            try:
+                proc = subprocess.Popen(aplay_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+                # Quick check if it failed immediately (e.g. Device Busy)
+                time.sleep(0.1)
+                if proc.poll() is not None:
+                    _, err = proc.communicate()
+                    if b"Device or resource busy" in err:
+                        print(f"[DEBUG] Audio device busy (attempt {attempt+1}/10), retrying...")
+                        time.sleep(0.3)
+                        continue
+                break # Success
+            except Exception as e:
+                print(f"[DEBUG] Audio startup error: {e}")
+                time.sleep(0.3)
+
+        if not proc or proc.poll() is not None:
+            print("[DEBUG] Failed to open audio device after retries.")
+            return
+
+        interrupted = False
+        try:
+            start_time = time.time()
+            chunk_idx = 0
+
+            while not self.stop_event.is_set():
+                if self.is_muted:
+                    interrupted = True
+                    break
+
+                # 1024 samples * 2 bytes per sample (S16_LE)
+                raw_chunk = stream.read(chunk_size * 2)
+                if not raw_chunk:
+                    break
+
+                # Lip-sync from unscaled signal, then apply software volume
+                audio_chunk = np.frombuffer(raw_chunk, dtype=np.int16)
+                vol = np.sqrt(np.mean(audio_chunk.astype(np.float32)**2))
+                if self.current_state == BotStates.SPEAKING:
+                    self.mouth_open = min(60, vol / 25)
+
+                vol_scale = getattr(self, 'volume', VOLUME)
+                if vol_scale != 1.0:
+                    scaled = np.clip(audio_chunk.astype(np.float32) * vol_scale, -32768, 32767).astype(np.int16)
+                    write_chunk = scaled.tobytes()
+                else:
+                    write_chunk = raw_chunk
+
+                try:
+                    proc.stdin.write(write_chunk)
+                    proc.stdin.flush()
+                except (BrokenPipeError, OSError) as e:
+                    print(f"[DEBUG] aplay write error: {e}")
+                    break
+
+                # No manual pacing — aplay's hardware buffer back-pressures stdin.write naturally.
+
+            # stop_event firing mid-stream is also an interruption
+            if self.stop_event.is_set():
+                interrupted = True
+        finally:
+            if proc.stdin:
+                try: proc.stdin.close()
+                except Exception: pass
+            if not interrupted:
+                # Natural end of stream — let aplay drain its 500ms ALSA buffer fully
+                # before we exit, otherwise the last words are cut off.
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    try: proc.terminate()
+                    except Exception: pass
+            else:
+                # Muted or stopped — kill immediately for instant silence
+                try: proc.terminate()
+                except Exception: pass
+            self.mouth_open = 0
+            self.mouth_ema = 0 # Final reset to closed
+            self.speaking_frame = 0
+
+    def _warmup_piper(self):
+        """Pre-spawn Piper (without aplay) to hide model-load latency behind STT.
+        Safe to call repeatedly — no-op if Piper is already running."""
+        if self._piper_proc is not None and self._piper_proc.poll() is None:
+            return
+        from core.config import PIPER_CMD, PIPER_MODEL
+        try:
+            self._piper_proc = subprocess.Popen(
+                [PIPER_CMD, "--model", PIPER_MODEL, "--output_raw"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            print("[TTS] Piper warmed up.")
+        except Exception as e:
+            print(f"[TTS] Piper warmup failed: {e}")
+            self._piper_proc = None
+
+    def _start_tts_turn(self):
+        """Start a persistent Piper + aplay pipeline for a single speaking turn.
+
+        Piper is kept alive for the entire turn so the TTS model is loaded only
+        once.  Every sentence is written to Piper's stdin; a reader thread pumps
+        the raw PCM output into aplay continuously — no per-sentence startup gap.
+        Reuses a pre-warmed Piper from _warmup_piper() if available.
+        """
+        from core.config import PIPER_CMD, PIPER_MODEL, ALSA_DEVICE
+
+        # Detect a pre-warmed Piper (loaded but not yet wired to aplay/reader)
+        piper_warm = (
+            self._piper_proc is not None and self._piper_proc.poll() is None
+            and self._piper_reader_thread is None and self._tts_aplay is None
+        )
+        if not piper_warm:
+            self._kill_tts_pipeline()
+
+        # Release ALSA: stop the thinking sound AND any other active sound
+        # (ack sounds are tracked in active_sounds, not thinking_audio_process).
+        self.is_thinking_sound_playing = False
+        if self.thinking_audio_process is not None:
+            try:
+                self.thinking_audio_process.terminate()
+                self.thinking_audio_process.wait(timeout=0.5)
+            except Exception:
+                pass
+            self.thinking_audio_process = None
+        for proc in list(self.active_sounds):
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+        # Start aplay (retry on busy ALSA device)
+        aplay_cmd = ["aplay", "-D", ALSA_DEVICE, "-r", "22050", "-f", "S16_LE",
+                     "-t", "raw", "-q", "--buffer-time=500000"]
+        for attempt in range(10):
+            try:
+                self._tts_aplay = subprocess.Popen(aplay_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+                time.sleep(0.05)
+                if self._tts_aplay.poll() is not None:
+                    _, err = self._tts_aplay.communicate()
+                    if b"Device or resource busy" in err:
+                        print(f"[TTS] Audio device busy (attempt {attempt+1}/10), retrying...")
+                        time.sleep(0.3)
+                        continue
+                break
+            except Exception as e:
+                print(f"[TTS] aplay startup error: {e}")
+                time.sleep(0.3)
+
+        if self._tts_aplay is None or self._tts_aplay.poll() is not None:
+            print("[TTS] Failed to open audio device after retries.")
+            self._tts_aplay = None
+            # Also kill any pre-warmed piper so speak() sees _piper_proc is None
+            # and bails cleanly rather than writing audio nobody can play.
+            if self._piper_proc is not None:
+                try:
+                    self._piper_proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    self._piper_proc.terminate()
+                    self._piper_proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+                self._piper_proc = None
+            return
+
+        # Spawn Piper if not already warmed up
+        if not piper_warm:
+            self._piper_proc = subprocess.Popen(
+                [PIPER_CMD, "--model", PIPER_MODEL, "--output_raw"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+
+        # Fresh lip-sync schedule for this turn: playback offsets restart at 0
+        # and _lip_start is stamped when the reader queues its first chunk.
+        with self._lip_lock:
+            self._lip_sched = []
+            self._lip_start = None
+            self._lip_end = None
+
+        # Reader thread: Piper stdout → aplay stdin (with lip-sync)
+        self._piper_reader_thread = threading.Thread(
+            target=self._piper_to_aplay_loop, daemon=True
+        )
+        self._piper_reader_thread.start()
+
+    def _piper_to_aplay_loop(self):
+        """Read Piper's raw PCM output and stream it into aplay with lip-sync."""
+        chunk_size = 512  # samples (~23 ms at 22050 Hz)
+        sample_rate = 22050
+        samples_written = 0  # drives each chunk's playback offset for lip-sync
+        exit_reason = "unknown"
+
+        while True:
+            try:
+                raw_chunk = self._piper_proc.stdout.read(chunk_size * 2)
+            except Exception as e:
+                exit_reason = f"piper read error: {e}"
+                break
+            if not raw_chunk:
+                exit_reason = "piper EOF (normal)"
+                break  # Piper stdout closed — all audio transferred
+
+            if self.is_muted:
+                exit_reason = "muted"
+                break  # mute_bmo will kill the pipeline
+
+            # Lip-sync: record this chunk's loudness against WHEN it will play,
+            # not when we queue it. We pump audio into aplay's buffer far faster
+            # than real time, so driving mouth_open here directly would race
+            # seconds ahead of what the user hears; update_animation replays the
+            # schedule in sync with playback instead.
+            audio_chunk = np.frombuffer(raw_chunk, dtype=np.int16)
+            vol = np.sqrt(np.mean(audio_chunk.astype(np.float32) ** 2))
+            if self.current_state == BotStates.SPEAKING:
+                play_offset = samples_written / sample_rate
+                with self._lip_lock:
+                    if self._lip_start is None:
+                        self._lip_start = time.time()
+                    self._lip_sched.append((play_offset, float(min(60, vol / 25))))
+                    self._lip_end = play_offset
+            samples_written += len(audio_chunk)
+
+            vol_scale = getattr(self, 'volume', VOLUME)
+            if vol_scale != 1.0:
+                scaled = np.clip(audio_chunk.astype(np.float32) * vol_scale, -32768, 32767).astype(np.int16)
+                write_chunk = scaled.tobytes()
+            else:
+                write_chunk = raw_chunk
+
+            try:
+                self._tts_aplay.stdin.write(write_chunk)
+                self._tts_aplay.stdin.flush()
+            except (BrokenPipeError, OSError) as e:
+                exit_reason = f"aplay write error: {e}"
+                print(f"[TTS] aplay write error: {e}")
+                break
+
+            # No manual pacing: aplay's 500 ms hardware buffer applies natural
+            # back-pressure on stdin.write once it's full. The old time.sleep()
+            # could stack on top of that and starve the buffer briefly.
+
+        print(f"[TTS] Reader thread exiting: {exit_reason}")
+
+        # Close aplay's stdin immediately when we're done pumping — this signals
+        # aplay to drain and exit as soon as the last bytes play out, without
+        # waiting for _end_tts_turn to call us back.
+        if exit_reason == "piper EOF (normal)" and self._tts_aplay is not None:
+            try:
+                self._tts_aplay.stdin.close()
+            except Exception:
+                pass
+
+        # On a normal EOF the reader finishes long before playback does — up to
+        # ~500 ms of audio is still draining from aplay's buffer. Leave the
+        # schedule in place so update_animation keeps the mouth moving through
+        # the tail and closes it (via _lip_end) when playback actually ends.
+        # Only force the mouth shut immediately on an abnormal exit (mute/error).
+        if exit_reason != "piper EOF (normal)":
+            with self._lip_lock:
+                self._lip_sched = []
+                self._lip_start = None
+                self._lip_end = None
+            self.mouth_open = 0
+            self.mouth_ema = 0
+            self.speaking_frame = 0
+
+    def _write_to_piper(self, text):
+        """Write one line of cleaned text to the persistent Piper process."""
+        if self._piper_proc is None or self._piper_proc.poll() is not None:
+            return
+        try:
+            self._piper_proc.stdin.write((text + "\n").encode("utf-8"))
+            self._piper_proc.stdin.flush()
+        except (BrokenPipeError, OSError) as e:
+            print(f"[TTS] Piper stdin write error: {e}")
+
+    def _end_tts_turn(self, drain=True):
+        """Close the Piper + aplay pipeline at the end of a speaking turn.
+
+        Closing Piper's stdin signals it to finish processing.  The reader thread
+        pumps remaining audio into aplay and then closes aplay's stdin itself.
+        We join the reader thread (which blocks until all audio is queued), then
+        wait for aplay to drain with no hard timeout so long responses always
+        finish playing.
+        """
+        # Signal Piper to finish — it will write remaining audio then close stdout
+        if self._piper_proc is not None:
+            try:
+                self._piper_proc.stdin.close()
+            except Exception:
+                pass
+
+        # Wait for reader thread to pump all remaining audio into aplay.
+        # The thread paces itself at real-time audio speed, so a 60-second
+        # response takes ~60 seconds.  No timeout — we must never cut BMO off
+        # mid-sentence; a hard limit here is the wrong tool.  The thread will
+        # always exit once piper's stdout closes.
+        if self._piper_reader_thread is not None:
+            self._piper_reader_thread.join()
+            self._piper_reader_thread = None
+
+        # Reap Piper process
+        if self._piper_proc is not None:
+            try:
+                self._piper_proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    self._piper_proc.terminate()
+                except Exception:
+                    pass
+            self._piper_proc = None
+
+        # The reader thread already closed aplay's stdin on a clean exit.
+        # Close it here too (idempotent) to handle early-exit cases, then wait.
+        if self._tts_aplay is not None:
+            try:
+                self._tts_aplay.stdin.close()
+            except Exception:
+                pass
+            if drain:
+                # Wait indefinitely — after stdin closes, aplay drains its
+                # hardware buffer (~500 ms) and exits on its own.  There is
+                # no hard cutoff; the response length drives the wait time.
+                print("[TTS] Waiting for aplay to finish draining...")
+                self._tts_aplay.wait()
+                print("[TTS] aplay finished.")
+            else:
+                try:
+                    self._tts_aplay.terminate()
+                except Exception:
+                    pass
+            self._tts_aplay = None
+
+        with self._lip_lock:
+            self._lip_sched = []
+            self._lip_start = None
+            self._lip_end = None
+        self.mouth_open = 0
+        self.mouth_ema = 0
+        self.speaking_frame = 0
+
+    def _kill_tts_pipeline(self):
+        """Hard-kill the Piper + aplay pipeline without draining (used by mute / turn start).
+
+        Tries a non-blocking acquire of `speak_lock` first so we don't race a
+        concurrent _start_tts_turn(); if we can't get it, we still proceed
+        (mute must always win) but the brief lock-attempt window narrows the
+        overlap with another thread that's mid-startup."""
+        got_lock = self.speak_lock.acquire(blocking=False)
+        try:
+            self._kill_tts_pipeline_unlocked()
+        finally:
+            if got_lock:
+                self.speak_lock.release()
+
+    def _kill_tts_pipeline_unlocked(self):
+        if self._piper_proc is not None:
+            try:
+                self._piper_proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                self._piper_proc.terminate()
+            except Exception:
+                pass
+
+        if self._piper_reader_thread is not None:
+            self._piper_reader_thread.join(timeout=1.0)
+            self._piper_reader_thread = None
+
+        if self._piper_proc is not None:
+            try:
+                self._piper_proc.wait(timeout=1.0)
+            except Exception:
+                pass
+            self._piper_proc = None
+
+        if self._tts_aplay is not None:
+            try:
+                self._tts_aplay.terminate()
+            except Exception:
+                pass
+            self._tts_aplay = None
+
+        with self._lip_lock:
+            self._lip_sched = []
+            self._lip_start = None
+            self._lip_end = None
+        self.mouth_open = 0
+        self.mouth_ema = 0
+        self.speaking_frame = 0
+
+    def speak(self, text, msg="Speaking...", end_of_turn=True):
+        """Synthesize text via Piper and play it through aplay.
+
+        Uses a persistent Piper process for the entire turn so the TTS model is
+        loaded only once — eliminating the per-sentence startup gap that caused
+        unnatural pauses in multi-sentence responses.
+        """
+        from core.tts import clean_text_for_speech
+
+        clean_text = clean_text_for_speech(text)
+        if not clean_text or not any(c.isalnum() for c in clean_text):
+            if end_of_turn:
+                self._end_tts_turn()
+            return
+
+        print(f"[TTS] {'Final' if end_of_turn else 'Mid'}: '{clean_text[:70]}'")
+
+        # Transition to SPEAKING state immediately for responsive lip-sync
+        if self.current_state != BotStates.DISPLAY_IMAGE:
+            if msg is not None:
+                self.set_state(BotStates.SPEAKING, msg)
+            elif self.current_state != BotStates.SPEAKING:
+                self.current_state = BotStates.SPEAKING
+                self.current_frame = 0
+                self.last_state_change = time.time()
+
+        with self.speak_lock:
+            try:
+                if not self.is_muted:
+                    # Lazily start the pipeline on the first sentence of a turn
+                    # A warmed Piper still needs its reader and audio player wired up.
+                    if (self._piper_proc is None or self._piper_proc.poll() is not None
+                            or self._piper_reader_thread is None or self._tts_aplay is None):
+                        self._start_tts_turn()
+                        if self._piper_proc is None:
+                            # Failed to start — skip audio, still transition state
+                            if end_of_turn and self.current_state == BotStates.SPEAKING:
+                                self.set_state(BotStates.IDLE, "Tap to speak")
+                            return
+
+                    # Write text to the running Piper (returns immediately)
+                    self._write_to_piper(clean_text)
+
+                    if end_of_turn:
+                        # Block until all audio has finished playing
+                        self._end_tts_turn(drain=True)
+                    # else: pipeline stays open, next sentence streams in gaplessly
+                else:
+                    time.sleep(0.2)
+                    if end_of_turn:
+                        self._end_tts_turn(drain=False)
+            except Exception as e:
+                print(f"[TTS] speak() error: {e}")
+                self.mouth_open = 0
+                self._end_tts_turn(drain=False)
+
+        # Return face to IDLE after the final sentence of the turn
+        if end_of_turn and self.current_state == BotStates.SPEAKING:
+            if msg is not None:
+                self.set_state(BotStates.IDLE, "Tap to speak")
+            else:
+                self.current_state = BotStates.IDLE
+                self.current_frame = 0
+                self.last_state_change = time.time()
+
+
+
+
+    def _handle_response_chunk(self, chunk, is_last=True):
+        """Processes a single chunk from the LLM, handling actions and speech."""
+        if not chunk.strip():
+            return
+            
+        # These will be updated in the main loop via side effects on self
+        # or we can just use self.current_image_url etc.
+        # But to match existing logic, we'll use regex here
+        
+        # 1. Handle JSON actions (brace-balanced — handles nested objects + lax spacing).
+        #    The model may emit several on one chunk (e.g. set_expression + set_timer),
+        #    so drain them all rather than acting on the first and speaking the rest.
+        while True:
+            action_data, span = extract_json_object(chunk)
+            if action_data is None:
+                break
+            if "action" not in action_data:
+                # Some other JSON-ish blob — drop it so it isn't spoken aloud.
+                chunk = (chunk[:span[0]] + chunk[span[1]:]).strip()
+                continue
+            if action_data.get("action") == "take_photo":
+                self.taking_photo = True
+                return
+            if action_data.get("action") == "display_image":
+                self.current_image_url = action_data.get("image_url")
+                chunk = (chunk[:span[0]] + chunk[span[1]:]).strip()
+            elif action_data.get("action") == "set_expression":
+                expr = (action_data.get("value") or "").lower()
+                allowed = {
+                    BotStates.HAPPY, BotStates.SAD, BotStates.ANGRY, BotStates.SURPRISED,
+                    BotStates.SLEEPY, BotStates.DIZZY, BotStates.CHEEKY, BotStates.HEART,
+                    BotStates.STARRY_EYED, BotStates.CONFUSED, BotStates.BORED,
+                    BotStates.CURIOUS, BotStates.DAYDREAM, BotStates.JAMMING,
+                    BotStates.SHHH, BotStates.LOW_BATTERY,
+                }
+                if expr in allowed:
+                    self.set_state(expr, f"Feeling {expr}...")
+                chunk = (chunk[:span[0]] + chunk[span[1]:]).strip()
+            elif action_data.get("action") == "play_music":
+                music_generation = self._music_generation
+                def music_worker():
+                    if not self._wait_until_idle({BotStates.SPEAKING, BotStates.THINKING}):
+                        return  # shutdown
+                    music_proc = self._play_music_generation(music_generation)
+                    if music_proc:
+                        try:
+                            music_proc.wait(timeout=600)
+                        except subprocess.TimeoutExpired:
+                            try: music_proc.terminate()
+                            except Exception: pass
+                        if self.current_state == BotStates.JAMMING:
+                            self.set_state(BotStates.IDLE, "Tap to speak")
+                threading.Thread(target=music_worker, daemon=True).start()
+                chunk = (chunk[:span[0]] + chunk[span[1]:]).strip()
+            elif action_data.get("action") == "set_timer":
+                # Real handler — was advertised in the system prompt but
+                # silently ignored.  Coerce minutes safely; clamp to [0.05, 720].
+                try:
+                    raw_min = action_data.get("minutes", 0)
+                    minutes = float(raw_min)
+                    minutes = max(0.05, min(720.0, minutes))  # 3 s … 12 h
+                    msg_text = (action_data.get("message") or "").strip()
+                    # Models like to echo the prompt's placeholder verbatim.
+                    if msg_text in ("", "...", "…"):
+                        msg_text = "Timer is up!"
+                    self.start_timer_thread(minutes, str(msg_text))
+                    print(f"[TIMER] Scheduled: {minutes} min — {msg_text!r}")
+                except (TypeError, ValueError) as e:
+                    print(f"[TIMER] Bad set_timer payload {action_data!r}: {e}")
+                chunk = (chunk[:span[0]] + chunk[span[1]:]).strip()
+            else:
+                # Unknown/legacy action (search_web, get_time, capture_image…).
+                # Must still consume it, or this loop never terminates.
+                print(f"[ACTION] Ignoring unknown action: {action_data.get('action')!r}")
+                chunk = (chunk[:span[0]] + chunk[span[1]:]).strip()
+
+        # 2. Speak the remaining text
+        if chunk.strip():
+            self.speak(chunk, end_of_turn=is_last)
+        elif is_last:
+            # Last chunk was a pure JSON action with no spoken text.  Close any
+            # open TTS pipeline so piper+aplay don't stay open holding ALSA.
+            self._end_tts_turn(drain=True)
+
+    # --- MAIN LOOP ---
+    def main_loop(self):
+        time.sleep(1) # Let UI settle
+        
+        # Load Wake Word
+        self.set_state(BotStates.WARMUP, "Loading Ear...")
+        try:
+            oww = Model(wakeword_model_paths=[WAKE_WORD_MODEL])
+        except Exception as e:
+            print(f"Failed to load wakeword model: {e}")
+            self.set_state(BotStates.ERROR, "Wake Word Error")
+            return
+
+        self.set_state(BotStates.SPEAKING, "Ready!")
+        greeting_proc = self.play_sound("greeting_sounds")
+        if greeting_proc:
+            def _await_greeting():
+                greeting_proc.wait()
+                if self.current_state == BotStates.SPEAKING:
+                    self.set_state(BotStates.IDLE, "Tap to speak")
+            threading.Thread(target=_await_greeting, daemon=True).start()
+        else:
+            self.set_state(BotStates.IDLE, "Tap to speak")
+
+        while not self.stop_event.is_set():
+            # 1. Wait for Wake Word
+            self._release_busy()
+            if self.wait_for_wakeword(oww):
+                # Block briefly if a trigger flow is mid-run; gives up after 2 s
+                if not self._busy_lock.acquire(timeout=2.0):
+                    print("[MAIN] Couldn't claim busy lock; another flow is running.")
+                    continue
+                self.is_busy = True
+                self.last_user_interaction = time.time()
+                # 2. Record
+                self.set_state(BotStates.LISTENING, "Listening...")
+                # Pre-warm Piper in parallel with STT so the first TTS chunk has zero start-up gap
+                threading.Thread(target=self._warmup_piper, daemon=True).start()
+                wav_file = self.record_audio()
+                
+                # 3. Transcribe
+                self.set_state(BotStates.THINKING, "Transcribing...")
+                self._thinking_sound_start()
+
+                user_text = self.transcribe(wav_file)
+                print(f"User Transcribed: {user_text}")
+                
+                if len(user_text) < 2:
+                    self.set_state(BotStates.IDLE, "Tap to speak")
+                    self._release_busy()
+                    self._thinking_sound_stop()
+                    continue
+
+                # 4. LLM
+                self.set_state(BotStates.THINKING, "Thinking...")
+
+                # We DO NOT stop the thinking sound loop here.
+                # Let it continue playing its current sound seamlessly while the LLM thinks.
+
+
+                try:
+                    full_response = ""
+                    self.current_image_url = None
+                    self.taking_photo = False
+                    
+                    # Lock LLM access to prevent screensaver interference
+                    with self.llm_lock:
+                        # Use a peekable-style approach to detect the last chunk
+                        gen = self.brain.stream_think(user_text)
+                        try:
+                            chunk = next(gen)
+                            while True:
+                                try:
+                                    next_chunk = next(gen)
+                                    # If we got here, 'chunk' is not the last one
+                                    self._handle_response_chunk(chunk, is_last=False)
+                                    full_response += chunk
+                                    chunk = next_chunk
+                                except StopIteration:
+                                    # 'chunk' was the last one
+                                    self._handle_response_chunk(chunk, is_last=True)
+                                    full_response += chunk
+                                    break
+                        except StopIteration:
+                            pass
+
+                    image_url = self.current_image_url
+                    taking_photo = self.taking_photo
+                    
+                    if taking_photo:
+                        self.set_state(BotStates.CAPTURING, "Taking Photo...")
+                        try:
+                            # Try libcamera-still (older) or rpicam-still (newer Pi OS)
+                            cam_cmd = None
+                            for candidate in ['libcamera-still', 'rpicam-still']:
+                                r = subprocess.run(['which', candidate], capture_output=True)
+                                if r.returncode == 0:
+                                    cam_cmd = candidate
+                                    break
+                            if cam_cmd is None:
+                                raise FileNotFoundError("No camera command found (libcamera-still / rpicam-still)")
+                            # Cap at 15 s — camera firmware can hang on USB glitches
+                            subprocess.run(
+                                [cam_cmd, '-o', 'temp.jpg', '--width', '640', '--height', '480',
+                                 '--nopreview', '-t', '2000', '--autofocus-mode', 'continuous'],
+                                check=True, timeout=15,
+                            )
+                            import base64
+                            with open('temp.jpg', 'rb') as img_file:
+                                b64_string = base64.b64encode(img_file.read()).decode('utf-8')
+                            self.set_state(BotStates.THINKING, "Analyzing...")
+                            self._thinking_sound_start()  # Idempotent — reuses existing loop if alive
+                            response = self.brain.analyze_image(b64_string, user_text)
+                            self._thinking_sound_stop()
+                            # Clean up the captured image — we don't need it anymore
+                            try:
+                                if os.path.exists('temp.jpg'):
+                                    os.remove('temp.jpg')
+                            except Exception:
+                                pass
+                            self.speak(response)
+                        except FileNotFoundError as e:
+                            print(f"Camera Error: {e}")
+                            self.speak("Hmm, BMO doesn't seem to have a camera connected right now. I can't take a photo!")
+
+                        except subprocess.TimeoutExpired:
+                            print("Camera Error: capture timed out after 15 s")
+                            self.speak("My camera took too long to respond. Let's try that again later!")
+
+                        except Exception as e:
+                            print(f"Camera Error: {e}")
+                            self.speak("I tried to take a photo, but my camera isn't working.")
+                    
+                    # 5. Display Image (if any). The pre-LLM lead-in (from
+                    # _quick_lead_in in core/llm.py) was already streamed and
+                    # spoken via _handle_response_chunk, so we don't need to
+                    # speak again here.
+                    if image_url:
+                        self.set_state(BotStates.DISPLAY_IMAGE, "Showing Image...")
+                        print(f"[IMAGE] Starting image display for: {image_url}")
+                        try:
+                            # Note: migrated to loremflickr
+                            print(f"[IMAGE] Downloading: {image_url}")
+                            req = urllib.request.Request(image_url, headers={'User-Agent': 'Mozilla/5.0'})
+                            with urllib.request.urlopen(req, timeout=8) as u:
+                                raw_data = u.read()
+                            print(f"[IMAGE] Downloaded: {len(raw_data)} bytes")
+                            from io import BytesIO
+                            from PIL import ImageOps, ImageDraw
+                            
+                            def apply_bmo_border(pil_img):
+                                # Resize and crop image to fit inside the inner LCD screen
+                                lcd_w, lcd_h = self.BG_WIDTH - 60, self.BG_HEIGHT - 60
+                                # Cover/resize logic
+                                img_ratio = pil_img.width / pil_img.height
+                                target_ratio = lcd_w / lcd_h
+                                if img_ratio > target_ratio:
+                                    # Image is wider, scale to height and crop width
+                                    new_h = lcd_h
+                                    new_w = int(new_h * img_ratio)
+                                else:
+                                    # Image is taller, scale to width and crop height
+                                    new_w = lcd_w
+                                    new_h = int(new_w / img_ratio)
+                                
+                                pil_img = pil_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                                # Crop center
+                                left = (new_w - lcd_w) / 2
+                                top = (new_h - lcd_h) / 2
+                                right = (new_w + lcd_w) / 2
+                                bottom = (new_h + lcd_h) / 2
+                                pil_img = pil_img.crop((left, top, right, bottom))
+                                
+                                # Add inner thick dark LCD bezel
+                                pil_img = ImageOps.expand(pil_img, border=10, fill="#1c201a")
+                                # Add BMO Teal outer casing
+                                pil_img = ImageOps.expand(pil_img, border=20, fill="#38b5a0")
+                                return pil_img
+
+                            img = Image.open(BytesIO(raw_data))
+                            img = apply_bmo_border(img)
+                            
+                            # Schedule Tkinter update on main thread for thread safety
+                            def show_image(pil_img=img):
+                                try:
+                                    self.current_display_image = ImageTk.PhotoImage(pil_img)
+                                    self.background_label.config(image=self.current_display_image)
+                                    print("[IMAGE] Displayed on screen")
+                                except Exception as e:
+                                    print(f"[IMAGE] Tkinter display error: {e}")
+                            
+                            self.master.after(0, show_image)
+                        except Exception as e:
+                            print(f"[IMAGE] Download/Display Error: {e}")
+
+                except Exception as e:
+                    print(f"ERROR in LLM/TTS pipeline: {e}")
+                    traceback.print_exc()
+
+                self.set_state(BotStates.IDLE, "Tap to speak")
+
+                self._release_busy()
+                # 1-second ALSA cooldown before re-opening the mic stream.
+                # Use manual_wake_event.wait() instead of sleep() so a tap during
+                # this window is not lost — it will be caught by wait_for_wakeword()
+                # on the very next loop iteration.
+                self.manual_wake_event.wait(timeout=1.0)
+
+    def trigger_random_thought(self, event=None):
+        """Manually trigger a random pondering thought (BMO's red button)."""
+        if self.current_state in [BotStates.LISTENING, BotStates.THINKING, BotStates.SPEAKING]:
+            return
+        if not self._try_claim_busy():
+            return  # another flow holds the busy lock
+
+        def run_thought():
+            from core.search import search_web, search_images
+            from core.config import LLM_URL, FAST_LLM_MODEL
+            import requests as http_requests
+
+            display_owns_busy = False
+            try:
+                topics = [
+                    "interesting fun fact of the day", "weather forecast today in Brantford, Ontario",
+                    "this day in history", "cool science discovery this week", "funny animal fact",
+                    "random wholesome internet story", "video game history fact", "weird food fact",
+                    "Adventure Time lore or trivia", "today's astronomy picture", "best joke of the day",
+                    "funny dad jokes", "hilarious puns", "unusual world records"
+                ]
+
+                topic = random.choice(topics)
+                for _ in range(3):
+                    if topic in self.recent_thoughts:
+                        topic = random.choice(topics)
+                    else:
+                        break
+
+                print(f"[BUTTON] Manually triggering thought for: {topic}")
+                self.set_state(BotStates.THINKING, "Thinking...")
+
+                search_result = search_web(topic)
+                if search_result and search_result not in ("SEARCH_EMPTY", "SEARCH_ERROR"):
+                    phrase = self.generate_thought_internal(search_result)
+
+                    if phrase:
+                        self.recent_thoughts.append(topic)
+                        # Check for image URL or subject (brace-balanced JSON)
+                        image_url = None
+                        action_data, span = extract_json_object(phrase)
+                        if action_data is not None and action_data.get("action") == "display_image":
+                            subject = action_data.get("subject") or action_data.get("image_url")
+                            if subject:
+                                if "://" in subject:
+                                    image_url = subject
+                                else:
+                                    image_url = search_images(subject)
+                            phrase = (phrase[:span[0]] + phrase[span[1]:]).strip()
+
+                        self.speak(phrase, msg="Pondering...")
+                        if image_url:
+                            # display_remote_image owns busy from here — don't double-release
+                            time.sleep(1.5)
+                            display_owns_busy = True
+                            self.display_remote_image(image_url, commentary_prompt=topic)
+                        else:
+                            self.set_state(BotStates.IDLE, "Tap to speak")
+                    else:
+                        self.set_state(BotStates.IDLE, "Tap to speak")
+                else:
+                    self.set_state(BotStates.IDLE, "Tap to speak")
+            except Exception as e:
+                print(f"[BUTTON] Thought error: {e}")
+                self.set_state(BotStates.IDLE, "Tap to speak")
+            finally:
+                if not display_owns_busy:
+                    self._release_busy()
+
+        threading.Thread(target=run_thought, daemon=True).start()
+
+    def trigger_music(self, event=None):
+        """Manually trigger BMO to play music and jam."""
+        if self.is_muted or self.current_state in [BotStates.WARMUP, BotStates.LISTENING, BotStates.THINKING, BotStates.SPEAKING, BotStates.JAMMING]:
+            return
+        if not self._try_claim_busy():
+            return
+
+        music_generation = self._music_generation
+
+        def run_music():
+            try:
+                if not self._wait_until_idle({BotStates.SPEAKING, BotStates.THINKING}):
+                    return
+                intros = [
+                    "Oh yeah! BMO is going to jam out!",
+                    "Time for music! La la la!",
+                    "BMO loves this song!",
+                    "Let BMO play you a tune!",
+                    "Music time! BMO is so excited!",
+                ]
+                self.speak(random.choice(intros), msg="Getting ready to jam...")
+                print("[MUSIC] Starting music playback...")
+                music_proc = self._play_music_generation(music_generation)
+                if music_proc:
+                    try:
+                        music_proc.wait(timeout=600)
+                    except subprocess.TimeoutExpired:
+                        try: music_proc.terminate()
+                        except Exception: pass
+                    time.sleep(1) # Extra buffer
+                    if self.current_state == BotStates.JAMMING:
+                        self.set_state(BotStates.IDLE, "Tap to speak")
+                elif music_generation == self._music_generation and not self.is_muted:
+                    self.speak("BMO wants to play music, but there are no songs loaded!")
+                elif not self.is_muted and self.current_state == BotStates.SPEAKING:
+                    self.set_state(BotStates.IDLE, "Music stopped")
+            finally:
+                self._release_busy()
+
+        threading.Thread(target=run_music, daemon=True).start()
+
+    def trigger_generate_image(self, event=None):
+        """Manually trigger an image generation."""
+        if self.current_state in [BotStates.LISTENING, BotStates.THINKING, BotStates.SPEAKING]:
+            return
+        if not self._try_claim_busy():
+            return
+
+        def run_image_thought():
+            from core.config import LLM_URL, FAST_LLM_MODEL
+            from core.search import search_images
+            import requests as http_requests
+
+            try:
+                self.set_state(BotStates.THINKING, "Imagining...")
+                
+                # Say something generic first
+                intros = [
+                    "BMO is feeling creative! Let me draw something for you.",
+                    "I am going to make some art!",
+                    "Time for BMO's art class! One moment...",
+                    "Let me paint a beautiful picture for you."
+                ]
+                self.speak(random.choice(intros), msg="Imagining...")
+                
+                prompt = "You are BMO. You want to show a picture. Output ONLY a short, vivid 3-5 word descriptive search term for an image (e.g. 'cute baby penguin' or 'colorful deep space nebula'). Do NOT say anything else."
+                payload = {
+                    "model": FAST_LLM_MODEL,
+                    "messages": [
+                        {"role": "system", "content": "You are BMO. You only output short image search terms."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "stream": False,
+                    "options": {"temperature": 0.9, "num_predict": 20}
+                }
+                
+                search_term = "cute robot"
+                try:
+                    resp = http_requests.post(LLM_URL, json=payload, timeout=30)
+                    if resp.status_code == 200:
+                        search_term = resp.json().get("message", {}).get("content", "").strip()
+                        search_term = search_term.replace('"', '').replace("'", '').replace('\n', '').strip()
+                except Exception as e:
+                    print(f"[IMAGE] LLM call failed: {e}")
+
+                # Find a real image
+                url = search_images(search_term)
+                
+                if not url:
+                    lock_id = random.randint(1, 100000)
+                    url = f"https://loremflickr.com/640/480/{search_term.replace(' ', ',')}?lock={lock_id}"
+                
+                # Wait for BMO to finish speaking the intro
+                if not self._wait_until_idle({BotStates.SPEAKING, BotStates.THINKING}):
+                    return
+                self.display_remote_image(url, commentary_prompt=search_term)
+            except Exception as e:
+                print(f"[IMAGE] Generator failed: {e}")
+                self.set_state(BotStates.IDLE, "Tap to speak")
+            finally:
+                self._release_busy()
+
+        threading.Thread(target=run_image_thought, daemon=True).start()
+
+    def display_remote_image(self, image_url, commentary_prompt=None):
+        """Fetch and display an image from a URL with BMO styling."""
+        def run_display():
+            self.set_state(BotStates.DISPLAY_IMAGE, "Visualizing...")
+            try:
+                import urllib.request
+                import urllib.parse
+                
+                # Safely encode the URL path and query
+                parts = urllib.parse.urlparse(image_url)
+                safe_path = urllib.parse.quote(urllib.parse.unquote(parts.path))
+                safe_query = urllib.parse.quote(urllib.parse.unquote(parts.query), safe='=&')
+                safe_url = urllib.parse.urlunparse((parts.scheme, parts.netloc, safe_path, parts.params, safe_query, parts.fragment))
+                
+                req = urllib.request.Request(safe_url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=15) as u:
+                    raw_data = u.read()
+                            
+                if not raw_data:
+                    raise Exception("Failed to download image data.")
+                
+                from io import BytesIO
+                from PIL import ImageOps, Image
+                
+                img = Image.open(BytesIO(raw_data))
+                
+                # Apply BMO border
+                lcd_w, lcd_h = self.BG_WIDTH - 60, self.BG_HEIGHT - 60
+                img_ratio = img.width / img.height
+                target_ratio = lcd_w / lcd_h
+                if img_ratio > target_ratio:
+                    new_h = lcd_h
+                    new_w = int(new_h * img_ratio)
+                else:
+                    new_w = lcd_w
+                    new_h = int(new_w / img_ratio)
+                img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                left = (new_w - lcd_w) / 2
+                top = (new_h - lcd_h) / 2
+                right = (new_w + lcd_w) / 2
+                bottom = (new_h + lcd_h) / 2
+                img = img.crop((left, top, right, bottom))
+                img = ImageOps.expand(img, border=10, fill="#1c201a")
+                img = ImageOps.expand(img, border=20, fill="#38b5a0")
+                
+                def show_img(p_img=img):
+                    try:
+                        self.current_display_image = ImageTk.PhotoImage(p_img)
+                        self.background_label.config(image=self.current_display_image)
+                    except Exception: pass
+                
+                self.master.after(0, show_img)
+                
+                if commentary_prompt:
+                    from core.config import LLM_URL, FAST_LLM_MODEL
+                    import requests as http_requests
+                    
+                    thought_prompt = f"You just drew a picture of: {commentary_prompt}. React to your artwork in one short sentence as BMO. Be proud of it!"
+                    payload = {
+                        "model": FAST_LLM_MODEL,
+                        "messages": [
+                            {"role": "system", "content": "You are BMO, a cute little robot. Keep it under 20 words."},
+                            {"role": "user", "content": thought_prompt}
+                        ],
+                        "stream": False,
+                        "options": {"temperature": 0.8, "num_predict": 40}
+                    }
+                    try:
+                        resp = http_requests.post(LLM_URL, json=payload, timeout=20)
+                        if resp.status_code == 200:
+                            commentary = resp.json().get("message", {}).get("content", "").strip()
+                            self.speak(commentary, msg="Admiring art...")
+                    except Exception as e:
+                        pass
+                
+                # 12 s display window — broken by app shutdown OR user tap
+                # (handle_click on DISPLAY_IMAGE state already returns to IDLE).
+                end_at = time.time() + 12
+                while time.time() < end_at:
+                    if self.stop_event.is_set() or self.current_state != BotStates.DISPLAY_IMAGE:
+                        break
+                    time.sleep(0.2)
+                if self.current_state == BotStates.DISPLAY_IMAGE:
+                    self.set_state(BotStates.IDLE, "Tap to speak")
+            except Exception as e:
+                print(f"[IMAGE] Failed to display: {e}")
+                self.set_state(BotStates.IDLE, "Tap to speak")
+            finally:
+                self._release_busy()
+
+        threading.Thread(target=run_display, daemon=True).start()
+
+    def generate_thought_internal(self, search_result):
+        """Shared logic for generating a BMO thought from search results."""
+        from core.config import LLM_URL, FAST_LLM_MODEL
+        import requests as http_requests
+
+        if not self.llm_lock.acquire(blocking=False):
+            return None
+        try:
+            # Sanitise the search snippet: strip HTML tags and unescape entities
+            # so the LLM never echoes raw markup into BMO's speech.
+            import html as _html
+            clean_result = re.sub(r'<[^>]+>', ' ', search_result)
+            clean_result = _html.unescape(clean_result)
+            clean_result = re.sub(r'\s+', ' ', clean_result).strip()
+
+            # Wrap the actual reply in [BMO]...[/BMO]. The stripper isolates
+            # whatever's between the markers, so any rule-echo or numbered
+            # preamble outside the tags is automatically discarded.
+            thought_prompt = (
+                "Read this real-world info, then share a short charming observation "
+                "as BMO (under 40 words). Make a STATEMENT — do NOT ask questions. "
+                "Wrap your reply between [BMO] and [/BMO] markers. "
+                "If the topic is visual, include ONE JSON action AFTER [/BMO]: "
+                '{"action": "display_image", "subject": "<3-5 word visual phrase>"} '
+                f"Info: {clean_result[:1500]}"
+            )
+            payload = {
+                "model": FAST_LLM_MODEL,
+                # Weather/search snippets carry ANSI escapes that crash hailo-ollama's
+                # JSON prompt renderer; the \s+ collapse above does not remove them.
+                "messages": sanitize_messages([
+                    {"role": "system", "content":
+                     "You are BMO, a cute robot musing to yourself. Always wrap your "
+                     "spoken reply in [BMO]...[/BMO] tags. Make statements, not questions. "
+                     "Be specific and under 40 words."},
+                    {"role": "user", "content": thought_prompt},
+                ]),
+                "stream": False,
+                "options": {"temperature": 0.8, "num_predict": 256}
+            }
+            resp = http_requests.post(LLM_URL, json=payload, timeout=60)
+            if resp.status_code == 200:
+                content = resp.json().get("message", {}).get("content", "").strip()
+                result = strip_prompt_leakage(content)
+                # If the LLM returned something but stripping left nothing, return
+                # the raw content (minus obvious junk) so the caller always gets text.
+                if not result and content:
+                    result = re.sub(r'[\[\]<>]', '', content).strip()
+                return result or None
+        except Exception as e:
+            print(f"[LLM] Thought generation error: {e}")
+        finally:
+            self.llm_lock.release()
+        return None
+
+    def screensaver_audio_loop(self):
+        import datetime
+        import requests as http_requests
+        from core.search import search_web, search_images
+        from core.config import LLM_URL, FAST_LLM_MODEL
+        
+        # Topics BMO might wonder about — used as web search seeds
+        search_topics = [
+            "interesting fun fact of the day",
+            "weather forecast today in Brantford, Ontario",
+            "this day in history",
+            "cool science discovery this week",
+            "funny animal fact",
+            "random wholesome internet story",
+            "video game history fact",
+            "weird food fact",
+            "Adventure Time lore or trivia",
+            "today's astronomy picture",
+            "best joke of the day",
+            "random Wikipedia article summary",
+            "latest space news from NASA",
+            "strange laws in Canada",
+            "mythology fun fact",
+            "how a computer works for kids",
+            "cool deep sea creatures",
+            "interesting insect facts",
+            "history of robots",
+            "why do cats purr",
+            "fastest land animals",
+            "tallest buildings in the world",
+            "invention of the telephone",
+            "what is a black hole",
+            "funny dad jokes",
+            "hilarious puns",
+            "knock knock jokes",
+            "short funny stories",
+            "unusual world records",
+            "history of board games",
+            "how honey is made",
+            "origins of common idioms",
+            "mysteries of the pyramids",
+            "first mission to the moon",
+            "evolution of video game consoles",
+            "how to make a paper airplane",
+            "why the sky is blue",
+            "fun facts about penguins",
+            "discovery of dinosaurs",
+            "life on Mars possibilities",
+            "history of ice cream",
+            "how the internet works for kids",
+            "cool chemistry experiments",
+            "amazing origami facts",
+            "the world's oldest trees",
+        ]
+        
+        # Fallback phrases if search/LLM fails
+        fallback_phrases = [
+            "I wonder what Finn and Jake are doing right now.",
+            "Does anyone want to play a video game? No? ...Okay.",
+            "La la la la la... BMO is the best!",
+            "Sometimes BMO just likes to hum a little tune.",
+            "Football... is a tough little guy.",
+        ]
+        
+        def is_llm_reachable():
+            """Quick health check — ping the Ollama base URL before making a full LLM call."""
+            try:
+                base_url = LLM_URL.replace("/api/chat", "")
+                r = http_requests.get(base_url, timeout=5)
+                return r.status_code == 200
+            except Exception:
+                return False
+        
+        while not self.stop_event.is_set():
+            # Honour stop_event so app shutdown doesn't have to wait up to 30 s.
+            if self.stop_event.wait(timeout=30):
+                break
+            
+            # Watchdog: if busy for >2 min with no new interaction, clear it.
+            # Uses last_user_interaction (not last_state_change) so a long
+            # DISPLAY_IMAGE view doesn't get force-cleared.
+            if self.is_busy and (time.time() - self.last_user_interaction > 120):
+                print("[WATCHDOG] BMO was busy for > 120s. Force-clearing is_busy.")
+                self._release_busy()
+                self.set_state(BotStates.IDLE, "Tap to speak")
+
+            if self.current_state != BotStates.SCREENSAVER or self.is_busy:
+                continue
+                
+            now = datetime.datetime.now()
+            hour = now.hour
+            
+            # Quiet Hours: 8 PM to 8 AM
+            if hour >= 20 or hour < 8:
+                continue
+            
+            # Skip if user was recently interacting
+            if time.time() - self.last_state_change < 60:
+                continue
+                
+            # Random visual-only boredom animations (~10% chance every 30s)
+            if random.random() < 0.10:
+                expr = random.choice([BotStates.HEART, BotStates.SLEEPY, BotStates.STARRY_EYED, BotStates.DIZZY])
+                self.set_state(expr, "Zzz..." if expr == BotStates.SLEEPY else "...")
+                # Hold the expression for 4 seconds, then revert to Screensaver.
+                # Bind expr now: the callback fires later, after the loop may have rebound it.
+                def revert(expr=expr):
+                    if self.current_state == expr:
+                        self.set_state(BotStates.SCREENSAVER, "Screensaver...")
+                self.master.after(4000, revert)
+                
+            # Random Persona Gags (~5% chance every 30s)
+            elif random.random() < 0.05:
+                persona = random.choice([BotStates.FOOTBALL, BotStates.DETECTIVE, BotStates.SIR_MANO, BotStates.LOW_BATTERY, BotStates.BEE])
+                self.set_state(persona, "...")
+                
+                # Play the matching sound effect
+                sound_file = os.path.join("sounds", "personas", f"{persona}.wav")
+                if not self.is_muted and os.path.exists(sound_file):
+                    try:
+                        subprocess.Popen(['aplay', '-D', ALSA_DEVICE, '-q', '--buffer-time=500000', sound_file])
+                    except Exception as e:
+                        pass
+                
+                # Hold the persona animation for 8 seconds
+                def revert_persona(persona=persona):
+                    if self.current_state == persona:
+                        self.set_state(BotStates.SCREENSAVER, "Screensaver...")
+                self.master.after(8000, revert_persona)
+            
+            # Random Pondering (~4% chance every 30s)
+            elif random.random() < 0.04:
+                if is_llm_reachable():
+                    try:
+                        # 1. Ask the LLM for a random topic
+                        topic = None
+                        try:
+                            avoid_list = ", ".join(f"'{t}'" for t in list(self.recent_thoughts)[-6:]) if self.recent_thoughts else "none"
+                            topic_messages = [
+                                {"role": "system", "content": (
+                                    "You are BMO's imagination. Pick ONE surprising, specific topic for BMO to ponder today. "
+                                    "Draw from any domain: science, history, nature, food, art, mythology, space, technology, "
+                                    "geography, animals, inventions, culture, or weird trivia. "
+                                    f"Do NOT repeat these recent topics: {avoid_list}. "
+                                    "Output ONLY the topic in under 10 words — no quotes, no explanation."
+                                )},
+                                {"role": "user", "content": "Give me a fresh, unexpected topic."}
+                            ]
+                            topic_payload = {
+                                "model": FAST_LLM_MODEL,
+                                "messages": topic_messages,
+                                "stream": False,
+                                "options": {"temperature": 1.2, "num_predict": 30}
+                            }
+                            topic_resp = http_requests.post(LLM_URL, json=topic_payload, timeout=10)
+                            if topic_resp.status_code == 200:
+                                topic = topic_resp.json().get("message", {}).get("content", "").strip().strip('"').strip("'")
+                                topic = re.sub(r'^Topic:|^BMO topic:|^I want to learn about: ', '', topic, flags=re.IGNORECASE)
+                                if topic in self.recent_thoughts:
+                                    topic = None  # force fallback to hardcoded list
+                        except Exception as e:
+                            print(f"[SCREENSAVER] LLM topic generation failed: {e}")
+
+                        if not topic or len(topic) < 3:
+                            topic = random.choice(search_topics)
+                            for _ in range(3):
+                                if topic in self.recent_thoughts:
+                                    topic = random.choice(search_topics)
+                                else:
+                                    break
+                                
+                        print(f"[SCREENSAVER] Searching for: {topic}")
+                        search_result = search_web(topic)
+                        
+                        phrase = None
+                        if search_result and search_result not in ("SEARCH_EMPTY", "SEARCH_ERROR"):
+                            phrase = self.generate_thought_internal(search_result)
+                            
+                            if phrase:
+                                self.recent_thoughts.append(topic)
+                                # Check for image URL or subject (brace-balanced JSON)
+                                image_url = None
+                                action_data, span = extract_json_object(phrase)
+                                if action_data is not None and action_data.get("action") == "display_image":
+                                    subject = action_data.get("subject") or action_data.get("image_url")
+                                    if subject:
+                                        if "://" in subject:
+                                            image_url = subject
+                                        else:
+                                            image_url = search_images(subject)
+                                    phrase = (phrase[:span[0]] + phrase[span[1]:]).strip()
+                                
+                                # Speak the thought (atomic claim — no TOCTOU)
+                                if phrase and self.current_state == BotStates.SCREENSAVER and self._try_claim_busy():
+                                    self.speak(phrase, msg="Pondering...")
+                                    self.last_screensaver_audio_time = time.time()
+
+                                    # Handle image display
+                                    if image_url:
+                                        # Wait for BMO to start speaking
+                                        time.sleep(1.5)
+                                        self.display_remote_image(image_url, commentary_prompt=topic)
+                                        # display_remote_image releases busy in its finally
+                                    else:
+                                        self._release_busy()
+                    except Exception as e:
+                        print(f"[SCREENSAVER] Thought failed: {e}")
+                        self._release_busy()
+                        self.set_state(BotStates.SCREENSAVER, "Sleeping...")
+                
+                # Revert to screensaver state if needed
+                if self.current_state != BotStates.SCREENSAVER and not self.is_busy and self.current_state != BotStates.DISPLAY_IMAGE:
+                    self.set_state(BotStates.SCREENSAVER, "Sleeping...")
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = BotGUI(root)
+    # Window-manager close (X button, system kill) routes through the same
+    # cleanup path as the Escape key — flushes memory.json, kills aplay, etc.
+    root.protocol("WM_DELETE_WINDOW", app.exit_fullscreen)
+    root.mainloop()
