@@ -1,1 +1,1 @@
-# BMO-AI-Assistant-32proto-firmware-
+# BMO-AI-Assistant-32proto-firmware
