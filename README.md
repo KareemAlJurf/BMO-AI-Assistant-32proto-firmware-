@@ -1,4 +1,4 @@
-# BMO-AI-Assistant-32proto-firmware
+# BMO-Feather-M0-Controller
 
 `code.py` runs on the Adafruit Feather M0 Basic with CircuitPython 5.2.0.
 Copy it to the root of CIRCUITPY. It uses built-in modules only.
